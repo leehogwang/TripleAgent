@@ -12,9 +12,10 @@ type SyntaxTheme = Record<string, unknown>
  */
 
 /**
- * Returns a static reason why the color-diff module is unavailable, or null if available.
+ * Returns a static reason why the color-diff module is unavailable.
+ * In the open-source build, this always returns a reason (never null).
  */
-export function getColorModuleUnavailableReason(): ColorModuleUnavailableReason | null {
+export function getColorModuleUnavailableReason(): ColorModuleUnavailableReason {
   if (isEnvDefinedFalsy(process.env.CLAUDE_CODE_SYNTAX_HIGHLIGHT)) {
     return 'env'
   }

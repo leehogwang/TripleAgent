@@ -335,8 +335,10 @@ async function resolveModelSelection({ rl, env, provider, modelArg, envKey, defa
     await rl.question(`Model for ${provider} [${existing}] (any model id is allowed): `)
   ).trim();
 
-  // Warn if the input looks like a menu number instead of a model name
-  if (answer && /^\d+$/.test(answer)) {
+  // Warn if the input looks like a menu number instead of a model name.
+  // Only applies to single/double digit numbers — real model IDs like
+  // "qwen2.5-coder:7b" contain non-digit characters and won't match.
+  if (answer && /^\d{1,2}$/.test(answer) && suggestions.length > 0) {
     process.stdout.write(
       `\n⚠  "${answer}" looks like a menu number, not a model name.\n` +
       `   Did you mean one of: ${suggestions.join(", ")}?\n` +
