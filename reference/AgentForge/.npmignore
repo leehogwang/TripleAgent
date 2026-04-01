@@ -1,0 +1,5 @@
+.git/
+.gitignore
+install.sh
+__pycache__/
+*.pyc

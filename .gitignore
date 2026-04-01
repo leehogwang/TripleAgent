@@ -2,3 +2,5 @@ node_modules
 dist
 .env
 *.log
+.tooling/node
+.tooling/tmp

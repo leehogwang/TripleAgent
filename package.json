@@ -1,17 +1,24 @@
 {
-  "name": "claw-dev-workspace",
+  "name": "triple-agent",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Claw Dev workspace with a multi-provider launcher and Anthropic-compatible proxy.",
+  "description": "Three-panel auth-backed CLI for Codex, Claude, and Gemini.",
+  "bin": {
+    "tripleagent": "./bin/tripleagent.js"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "check": "tsc --noEmit -p tsconfig.json",
-    "dev": "tsx src/index.ts",
-    "claw-dev": "node Leonxlnx-claude-code/claw-dev-launcher.js",
-    "proxy:compat": "tsx src/anthropicCompatProxy.ts",
-    "proxy:gemini": "tsx src/anthropicCompatProxy.ts",
-    "start": "node dist/index.js"
+    "bootstrap:node22": "bash scripts/ensure-node22.sh",
+    "npm22": "bash scripts/npm22.sh",
+    "build": "bash scripts/node22.sh ./node_modules/typescript/bin/tsc -p tsconfig.json",
+    "check": "bash scripts/node22.sh ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+    "dev": "bash scripts/node22.sh ./node_modules/tsx/dist/cli.mjs src/index.ts",
+    "claw-dev": "bash scripts/node22.sh Leonxlnx-claude-code/claw-dev-launcher.js",
+    "proxy:compat": "bash scripts/node22.sh ./node_modules/tsx/dist/cli.mjs src/anthropicCompatProxy.ts",
+    "proxy:gemini": "bash scripts/node22.sh ./node_modules/tsx/dist/cli.mjs src/anthropicCompatProxy.ts",
+    "start": "bash scripts/node22.sh dist/index.js",
+    "triple-agent": "bash scripts/node22.sh ./node_modules/tsx/dist/cli.mjs src/index.ts",
+    "dry-run:triple": "bash scripts/node22.sh ./node_modules/tsx/dist/cli.mjs src/index.ts dry-run"
   },
   "engines": {
     "node": ">=22"
@@ -31,5 +38,15 @@
     "@types/react": "^19.2.2",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2"
-  }
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "src/",
+    "scripts/",
+    "shared/",
+    "Leonxlnx-claude-code/",
+    "README.md",
+    "package.json"
+  ]
 }

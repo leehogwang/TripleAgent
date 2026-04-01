@@ -1,16 +1,21 @@
-# Claw Dev
+# TripleAgent
 
-Claw Dev is a local multi-provider coding assistant launcher for the bundled terminal client in this repository. It gives you one entry point and lets you choose how model requests are resolved at startup:
+TripleAgent is a three-panel terminal assistant that asks the same question to `Codex`, `Claude`, and `Gemini` at once. The runtime is auth-backed: each provider uses its native CLI login session instead of API keys, so usage is charged against the logged-in plan where supported.
 
-- Anthropic account login or `ANTHROPIC_API_KEY`
-- OpenAI through a local Anthropic-compatible proxy
-- Google Gemini through a local Anthropic-compatible proxy
-- Groq through a local Anthropic-compatible proxy
-- Copilot through the GitHub Models API
-- z.ai through a local Anthropic-compatible proxy
-- Ollama through a local Anthropic-compatible proxy
+Current panel order:
 
-Claw Dev is designed to feel like one tool rather than a provider-specific wrapper. The launcher, provider prompts, environment variables, and documentation are all centered around the `Claw Dev` name.
+- `Codex`
+- `Claude`
+- `Gemini`
+
+Current runtime behavior:
+
+- one shared composer broadcasts normal prompts to all authenticated panels
+- `/plan` switches all ready panels into planning mode
+- auth failures dim the affected panel and remove it from normal broadcasts
+- locked panels only allow auth-related recovery actions such as `/status`, `/login`, and `/logout`
+
+This repository still contains the original `claw-dev` launcher and proxy assets, but the primary entrypoint is now `TripleAgent`.
 
 ## Repository Layout
 
@@ -146,10 +151,24 @@ Editing `.env` is optional. Claw Dev can prompt for missing values interactively
 
 ## Quick Start
 
-Start Claw Dev from the repository root on any platform:
+Install dependencies and start TripleAgent from the repository root:
 
 ```bash
-npm run claw-dev
+npm run bootstrap:node22
+bash scripts/npm22.sh install
+npm run triple-agent
+```
+
+Check auth state for all three providers:
+
+```bash
+npm run triple-agent -- auth status
+```
+
+Run the real three-provider smoke test:
+
+```bash
+npm run dry-run:triple
 ```
 
 Or launch it directly from the bundled client directory on Windows:

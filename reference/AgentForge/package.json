@@ -1,0 +1,36 @@
+{
+  "name": "agentforge-multi",
+  "version": "0.1.53",
+  "description": "Multi-agent CLI: Worker + Evaluator agents collaborate in a loop to achieve your goal",
+  "keywords": [
+    "ai",
+    "agent",
+    "multi-agent",
+    "cli",
+    "codex",
+    "llm",
+    "automation"
+  ],
+  "homepage": "https://github.com/<your-username>/AgentForge",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/<your-username>/AgentForge.git"
+  },
+  "license": "MIT",
+  "bin": {
+    "agentforge": "./bin/agentforge.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "files": [
+    "agentforge",
+    "bin/",
+    "scripts/",
+    "README.md",
+    "README.ko.md"
+  ]
+}
