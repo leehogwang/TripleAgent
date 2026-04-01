@@ -14,6 +14,7 @@ type ProcessResult = {
   stdout: string;
   stderr: string;
   interrupted: boolean;
+  timedOut: boolean;
 };
 
 const GEMINI_NOISE_PATTERNS = [
@@ -21,15 +22,21 @@ const GEMINI_NOISE_PATTERNS = [
   /^Using FileKeychain fallback for secure storage\./,
   /^Loaded cached credentials\./,
   /^\[ERROR\] \[IDEClient\] Directory mismatch\./,
+  /^\[ERROR\] \[IDEClient\] Failed to connect to IDE companion extension\./,
 ];
+
+const GEMINI_MODEL = "gemini-2.5-flash";
 
 const AUTH_FAILURE_PATTERNS = [
   /not logged in/i,
   /login required/i,
-  /authentication/i,
+  /authentication (failed|required|expired|error)/i,
   /reauthenticate/i,
-  /sign in/i,
-  /oauth/i,
+  /sign in (again|to continue|required)/i,
+  /session expired/i,
+  /invalid credentials/i,
+  /please (log in|sign in)/i,
+  /oauth[^.\n]*(expired|failed|required|missing)/i,
   /please run .*auth login/i,
 ];
 
@@ -70,6 +77,9 @@ function sanitizeGeminiEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env = { ...source };
   delete env.GEMINI_API_KEY;
   delete env.GOOGLE_API_KEY;
+  delete env.GEMINI_CLI_IDE_SERVER_PORT;
+  delete env.GEMINI_CLI_IDE_WORKSPACE_PATH;
+  delete env.GEMINI_CLI_IDE_AUTH_TOKEN;
   return env;
 }
 
@@ -106,13 +116,20 @@ function spawnCollectedProcess(
   cwd: string,
   env: NodeJS.ProcessEnv,
   signal?: AbortSignal,
+  timeoutMs?: number,
 ): ProviderTurnHandle {
   let child: ChildProcess | undefined;
   let killTimer: NodeJS.Timeout | undefined;
+  let processTimer: NodeJS.Timeout | undefined;
   let interrupted = signal?.aborted ?? false;
+  let timedOut = false;
 
-  const cancel = () => {
-    interrupted = true;
+  const terminate = (mode: "interrupt" | "timeout") => {
+    if (mode === "interrupt") {
+      interrupted = true;
+    } else {
+      timedOut = true;
+    }
     if (!child || child.killed) {
       return;
     }
@@ -132,6 +149,10 @@ function spawnCollectedProcess(
     }, 1000);
   };
 
+  const cancel = () => {
+    terminate("interrupt");
+  };
+
   const promise = new Promise<ProcessResult>((resolve) => {
     let stdout = "";
     let stderr = "";
@@ -145,11 +166,15 @@ function spawnCollectedProcess(
       if (killTimer) {
         clearTimeout(killTimer);
       }
+      if (processTimer) {
+        clearTimeout(processTimer);
+      }
       resolve({
         code,
         stdout,
         stderr,
         interrupted,
+        timedOut,
       });
     };
 
@@ -162,6 +187,11 @@ function spawnCollectedProcess(
 
     const handleAbort = () => cancel();
     signal?.addEventListener("abort", handleAbort, { once: true });
+    if (timeoutMs && timeoutMs > 0) {
+      processTimer = setTimeout(() => {
+        terminate("timeout");
+      }, timeoutMs);
+    }
 
     spawned.stdout?.on("data", (chunk: Buffer | string) => {
       stdout += chunk.toString();
@@ -215,8 +245,9 @@ function quotaLockMessage(provider: ProviderRunArgs["provider"]): string {
 function detectLockout(
   provider: ProviderRunArgs["provider"],
   output: string,
+  exitCode: number,
 ): { lockReason?: PanelLockReason; lockMessage?: string } {
-  if (detectAuthFailure(output)) {
+  if (exitCode !== 0 && detectAuthFailure(output)) {
     return {
       lockReason: "auth",
       lockMessage: "Authentication expired. This panel is now locked.",
@@ -312,6 +343,17 @@ function parseGeminiJson(output: string): string {
 function normalizeProviderResult(command: string, args: string[], result: ProcessResult): ProviderRunResult {
   const provider = inferProvider(command, args);
 
+  if (result.timedOut) {
+    return {
+      ok: false,
+      text: `${panelName(provider)} timed out while waiting for a response.`,
+      rawOutput: [result.stdout, result.stderr].filter(Boolean).join("\n").trim(),
+      interrupted: false,
+      lockReason: undefined,
+      lockMessage: undefined,
+    };
+  }
+
   if (result.interrupted) {
     return {
       ok: false,
@@ -326,7 +368,7 @@ function normalizeProviderResult(command: string, args: string[], result: Proces
   if (provider === "claude") {
     const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
     const text = parseClaudeJson(result.stdout) || output || "(empty response)";
-    const lockout = detectLockout(provider, output || text);
+    const lockout = detectLockout(provider, output || text, result.code);
     return {
       ok: result.code === 0 && !lockout.lockReason,
       text,
@@ -339,7 +381,7 @@ function normalizeProviderResult(command: string, args: string[], result: Proces
 
   if (provider === "gemini") {
     const output = sanitizeGeminiText([result.stdout, result.stderr].filter(Boolean).join("\n"));
-    const lockout = detectLockout(provider, output);
+    const lockout = detectLockout(provider, output, result.code);
     return {
       ok: result.code === 0 && !lockout.lockReason,
       text: parseGeminiJson(result.stdout) || output || "(empty response)",
@@ -352,7 +394,7 @@ function normalizeProviderResult(command: string, args: string[], result: Proces
 
   const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
   const parsed = parseCodexJson(result.stdout);
-  const lockout = detectLockout(provider, output);
+  const lockout = detectLockout(provider, output, result.code);
   return {
     ok: result.code === 0 && !lockout.lockReason,
     text: parsed || output || "(empty response)",
@@ -361,6 +403,17 @@ function normalizeProviderResult(command: string, args: string[], result: Proces
     lockReason: lockout.lockReason,
     lockMessage: lockout.lockMessage,
   };
+}
+
+function panelName(provider: ProviderRunArgs["provider"]): string {
+  switch (provider) {
+    case "codex":
+      return "Codex";
+    case "claude":
+      return "Claude";
+    case "gemini":
+      return "Gemini";
+  }
 }
 
 function inferProvider(command: string, args: string[]): ProviderRunArgs["provider"] {
@@ -388,19 +441,16 @@ export function startProviderTurn(args: ProviderRunArgs): ProviderTurnHandle {
       "--permission-mode",
       args.planMode ? "plan" : "acceptEdits",
     ];
-    if (args.sessionId) {
-      cliArgs.push("--session-id", args.sessionId);
-    }
     cliArgs.push(bridgedPrompt);
     return spawnCollectedProcess(process.execPath, cliArgs, args.cwd, process.env, args.signal);
   }
 
   if (args.provider === "gemini") {
-    const cliArgs = ["-p", bridgedPrompt, "--output-format", "json"];
+    const cliArgs = ["-p", bridgedPrompt, "--model", GEMINI_MODEL, "--output-format", "json"];
     if (args.planMode) {
       cliArgs.push("--approval-mode", "plan");
     }
-    return spawnCollectedProcess("gemini", cliArgs, args.cwd, sanitizeGeminiEnv(process.env), args.signal);
+    return spawnCollectedProcess("gemini", cliArgs, args.cwd, sanitizeGeminiEnv(process.env), args.signal, 60000);
   }
 
   const codexArgs = [

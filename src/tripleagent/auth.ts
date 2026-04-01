@@ -131,6 +131,9 @@ function sanitizeGeminiEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env = { ...source };
   delete env.GEMINI_API_KEY;
   delete env.GOOGLE_API_KEY;
+  delete env.GEMINI_CLI_IDE_SERVER_PORT;
+  delete env.GEMINI_CLI_IDE_WORKSPACE_PATH;
+  delete env.GEMINI_CLI_IDE_AUTH_TOKEN;
   return env;
 }
 

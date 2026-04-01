@@ -101,15 +101,36 @@ function consumeBackspaceControlChars(
 export function HarnessTextInput(props: HarnessTextInputProps): React.ReactNode {
   const [cursorOffset, setCursorOffset] = useState(() => splitGraphemes(props.value).length);
   const previousFocusRef = React.useRef(props.focus);
+  const valueRef = React.useRef(props.value);
+  const cursorOffsetRef = React.useRef(cursorOffset);
+
+  const syncValueAndCursor = React.useCallback((nextValue: string, nextCursorOffset: number) => {
+    valueRef.current = nextValue;
+    cursorOffsetRef.current = nextCursorOffset;
+    props.onChange(nextValue);
+    setCursorOffset(nextCursorOffset);
+  }, [props]);
+
+  const moveCursor = React.useCallback((nextCursorOffset: number) => {
+    cursorOffsetRef.current = nextCursorOffset;
+    setCursorOffset(nextCursorOffset);
+  }, []);
 
   useEffect(() => {
     const graphemeCount = splitGraphemes(props.value).length;
-    setCursorOffset((current) => clamp(current, 0, graphemeCount));
+    valueRef.current = props.value;
+    setCursorOffset((current) => {
+      const nextOffset = clamp(current, 0, graphemeCount);
+      cursorOffsetRef.current = nextOffset;
+      return nextOffset;
+    });
   }, [props.value]);
 
   useEffect(() => {
     if (props.focus && !previousFocusRef.current) {
-      setCursorOffset(splitGraphemes(props.value).length);
+      const nextOffset = splitGraphemes(props.value).length;
+      cursorOffsetRef.current = nextOffset;
+      setCursorOffset(nextOffset);
     }
     previousFocusRef.current = props.focus;
   }, [props.focus, props.value]);
@@ -120,72 +141,70 @@ export function HarnessTextInput(props: HarnessTextInputProps): React.ReactNode 
         return;
       }
 
-      const controlBackspaces = consumeBackspaceControlChars(input, props.value, cursorOffset);
+      const currentValue = valueRef.current;
+      const currentCursorOffset = cursorOffsetRef.current;
+
+      const controlBackspaces = consumeBackspaceControlChars(input, currentValue, currentCursorOffset);
       if (controlBackspaces.consumed) {
-        props.onChange(controlBackspaces.value);
-        setCursorOffset(controlBackspaces.cursorOffset);
+        syncValueAndCursor(controlBackspaces.value, controlBackspaces.cursorOffset);
         return;
       }
 
       if (key.return) {
-        props.onSubmit(props.value);
+        props.onSubmit(currentValue);
         return;
       }
 
       if (key.leftArrow) {
-        setCursorOffset((current) => clamp(current - 1, 0, splitGraphemes(props.value).length));
+        moveCursor(clamp(currentCursorOffset - 1, 0, splitGraphemes(currentValue).length));
         return;
       }
 
       if (key.rightArrow) {
-        setCursorOffset((current) => clamp(current + 1, 0, splitGraphemes(props.value).length));
+        moveCursor(clamp(currentCursorOffset + 1, 0, splitGraphemes(currentValue).length));
         return;
       }
 
       if (key.home || (key.ctrl && input === "a")) {
-        setCursorOffset(0);
+        moveCursor(0);
         return;
       }
 
       if (key.end || (key.ctrl && input === "e")) {
-        setCursorOffset(splitGraphemes(props.value).length);
+        moveCursor(splitGraphemes(currentValue).length);
         return;
       }
 
       if (key.backspace || (key.ctrl && input === "h")) {
-        const next = deleteBeforeCursor(props.value, cursorOffset);
-        props.onChange(next.value);
-        setCursorOffset(next.cursorOffset);
+        const next = deleteBeforeCursor(currentValue, currentCursorOffset);
+        syncValueAndCursor(next.value, next.cursorOffset);
         return;
       }
 
       if (key.delete && !key.ctrl && !key.meta && !key.shift) {
-        const next = deleteBeforeCursor(props.value, cursorOffset);
-        props.onChange(next.value);
-        setCursorOffset(next.cursorOffset);
+        const next = deleteBeforeCursor(currentValue, currentCursorOffset);
+        syncValueAndCursor(next.value, next.cursorOffset);
         return;
       }
 
       if (key.delete || (key.ctrl && input === "d")) {
-        const next = deleteAtCursor(props.value, cursorOffset);
-        props.onChange(next.value);
-        setCursorOffset(next.cursorOffset);
+        const next = deleteAtCursor(currentValue, currentCursorOffset);
+        syncValueAndCursor(next.value, next.cursorOffset);
         return;
       }
 
       if (key.ctrl && input === "u") {
-        props.onChange("");
-        setCursorOffset(0);
+        syncValueAndCursor("", 0);
         return;
       }
 
       if (key.ctrl && input === "b") {
-        setCursorOffset((current) => clamp(current - 1, 0, splitGraphemes(props.value).length));
+        moveCursor(clamp(currentCursorOffset - 1, 0, splitGraphemes(currentValue).length));
         return;
       }
 
       if (key.ctrl && input === "f") {
-        setCursorOffset((current) => clamp(current + 1, 0, splitGraphemes(props.value).length));
+        moveCursor(clamp(currentCursorOffset + 1, 0, splitGraphemes(currentValue).length));
         return;
       }
 
@@ -200,9 +219,8 @@ export function HarnessTextInput(props: HarnessTextInputProps): React.ReactNode 
         !input.slice(0, -1).includes("\r") &&
         input[input.length - 2] !== "\\";
 
-      const next = insertAtCursor(props.value, cursorOffset, normalizedInput);
-      props.onChange(next.value);
-      setCursorOffset(next.cursorOffset);
+      const next = insertAtCursor(currentValue, currentCursorOffset, normalizedInput);
+      syncValueAndCursor(next.value, next.cursorOffset);
 
       if (trailingEnter) {
         props.onSubmit(next.value);
@@ -237,5 +255,5 @@ export function HarnessTextInput(props: HarnessTextInputProps): React.ReactNode 
     return <Text color="gray">{props.placeholder}</Text>;
   }
 
-  return <Text wrap="truncate-end">{rendered}</Text>;
+  return <Text wrap="wrap">{rendered}</Text>;
 }

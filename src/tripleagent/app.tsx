@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Box, render, Text, useApp, useInput } from "ink";
+import { Box, render, Text, useApp, useInput, useStdout } from "ink";
+import stringWidth from "string-width";
+import wrapAnsi from "wrap-ansi";
 
 import { getAuthStatuses } from "./auth.js";
 import { buildHelpText, parseSlashCommand } from "./commands.js";
@@ -38,9 +40,15 @@ type RunTurnOptions = {
   displayPrompt?: string;
 };
 
-type CollapsedPaste = {
-  raw: string;
+type PastedTextRef = {
+  id: number;
+  content: string;
   placeholder: string;
+};
+
+type TranscriptLine = {
+  role: TranscriptEntry["role"];
+  text: string;
 };
 
 const PROVIDERS: ProviderId[] = ["codex", "claude", "gemini"];
@@ -53,6 +61,9 @@ const AUTH_LOCK_MESSAGE =
 
 const WORKTREE_WARNING =
   "Git worktrees are unavailable in this directory. TripleAgent can still answer prompts, but /pick and /fuse are disabled.";
+
+const pastedTextSegmenter = new Intl.Segmenter("ko", { granularity: "grapheme" });
+const PASTED_TEXT_REF_PATTERN_SOURCE = String.raw`\[Pasted Content (\d+) chars #(\d+)\]`;
 
 function now(): string {
   return new Date().toLocaleTimeString("ko-KR", { hour12: false });
@@ -82,8 +93,12 @@ function countLineBreaks(text: string): number {
   return (text.match(/\r\n|\r|\n/g) || []).length;
 }
 
-function buildPastedContentPlaceholder(charCount: number): string {
-  return `[Pasted Content ${charCount} chars]`;
+function splitTextGraphemes(value: string): string[] {
+  return Array.from(pastedTextSegmenter.segment(value), (segment) => segment.segment);
+}
+
+function buildPastedContentPlaceholder(id: number, charCount: number): string {
+  return `[Pasted Content ${charCount} chars #${id}]`;
 }
 
 function describeInsertedSegment(previousValue: string, nextValue: string): {
@@ -91,32 +106,39 @@ function describeInsertedSegment(previousValue: string, nextValue: string): {
   inserted: string;
   suffix: string;
 } {
+  const previousGraphemes = splitTextGraphemes(previousValue);
+  const nextGraphemes = splitTextGraphemes(nextValue);
+
   let prefixLength = 0;
   while (
-    prefixLength < previousValue.length &&
-    prefixLength < nextValue.length &&
-    previousValue[prefixLength] === nextValue[prefixLength]
+    prefixLength < previousGraphemes.length &&
+    prefixLength < nextGraphemes.length &&
+    previousGraphemes[prefixLength] === nextGraphemes[prefixLength]
   ) {
     prefixLength += 1;
   }
 
   let suffixLength = 0;
   while (
-    suffixLength < previousValue.length - prefixLength &&
-    suffixLength < nextValue.length - prefixLength &&
-    previousValue[previousValue.length - 1 - suffixLength] === nextValue[nextValue.length - 1 - suffixLength]
+    suffixLength < previousGraphemes.length - prefixLength &&
+    suffixLength < nextGraphemes.length - prefixLength &&
+    previousGraphemes[previousGraphemes.length - 1 - suffixLength] === nextGraphemes[nextGraphemes.length - 1 - suffixLength]
   ) {
     suffixLength += 1;
   }
 
   return {
-    prefix: nextValue.slice(0, prefixLength),
-    inserted: nextValue.slice(prefixLength, nextValue.length - suffixLength),
-    suffix: nextValue.slice(nextValue.length - suffixLength),
+    prefix: nextGraphemes.slice(0, prefixLength).join(""),
+    inserted: nextGraphemes.slice(prefixLength, nextGraphemes.length - suffixLength).join(""),
+    suffix: nextGraphemes.slice(nextGraphemes.length - suffixLength).join(""),
   };
 }
 
-function maybeCollapsePastedContent(previousValue: string, nextValue: string): CollapsedPaste | undefined {
+function maybeCollapsePastedContent(
+  previousValue: string,
+  nextValue: string,
+  nextId: number,
+): PastedTextRef | undefined {
   if (nextValue.length <= previousValue.length) {
     return undefined;
   }
@@ -131,46 +153,56 @@ function maybeCollapsePastedContent(previousValue: string, nextValue: string): C
     return undefined;
   }
 
-  const placeholder = buildPastedContentPlaceholder(insertion.inserted.length);
+  const placeholder = buildPastedContentPlaceholder(nextId, insertion.inserted.length);
   return {
-    raw: insertion.inserted,
+    id: nextId,
+    content: insertion.inserted,
     placeholder,
   };
 }
 
-function retainCollapsedPastes(previous: CollapsedPaste[] | undefined, nextValue: string): CollapsedPaste[] {
-  if (!previous || previous.length === 0) {
-    return [];
-  }
-  const retained: CollapsedPaste[] = [];
-  let searchOffset = 0;
-  for (const collapsed of previous) {
-    const matchIndex = nextValue.indexOf(collapsed.placeholder, searchOffset);
-    if (matchIndex === -1) {
-      continue;
-    }
-    retained.push(collapsed);
-    searchOffset = matchIndex + collapsed.placeholder.length;
-  }
-  return retained;
+function parsePastedTextRefIds(value: string): number[] {
+  return Array.from(value.matchAll(new RegExp(PASTED_TEXT_REF_PATTERN_SOURCE, "g")), (match) =>
+    Number.parseInt(match[2] ?? "0", 10),
+  ).filter((id) => Number.isFinite(id) && id > 0);
 }
 
-function expandCollapsedPastes(value: string, collapsed: CollapsedPaste[] | undefined): string {
-  if (!collapsed || collapsed.length === 0) {
+function retainPastedTextRefs(
+  previous: Record<number, PastedTextRef> | undefined,
+  nextValue: string,
+): Record<number, PastedTextRef> {
+  if (!previous) {
+    return {};
+  }
+  const referencedIds = new Set(parsePastedTextRefIds(nextValue));
+  return Object.fromEntries(
+    Object.entries(previous).filter(([key]) => referencedIds.has(Number.parseInt(key, 10))),
+  );
+}
+
+function expandPastedTextRefs(value: string, pastedTextRefs: Record<number, PastedTextRef> | undefined): string {
+  if (!pastedTextRefs) {
     return value;
   }
+  const refs = Array.from(value.matchAll(new RegExp(PASTED_TEXT_REF_PATTERN_SOURCE, "g"))).map((match) => ({
+    id: Number.parseInt(match[2] ?? "0", 10),
+    index: match.index ?? -1,
+    match: match[0],
+  }));
   let expanded = value;
-  let searchOffset = 0;
-  for (const item of collapsed) {
-    const matchIndex = expanded.indexOf(item.placeholder, searchOffset);
-    if (matchIndex === -1) {
+  for (let index = refs.length - 1; index >= 0; index -= 1) {
+    const ref = refs[index];
+    if (!ref || ref.index < 0) {
+      continue;
+    }
+    const pastedText = pastedTextRefs[ref.id];
+    if (!pastedText) {
       continue;
     }
     expanded =
-      expanded.slice(0, matchIndex) +
-      item.raw +
-      expanded.slice(matchIndex + item.placeholder.length);
-    searchOffset = matchIndex + item.raw.length;
+      expanded.slice(0, ref.index) +
+      pastedText.content +
+      expanded.slice(ref.index + ref.match.length);
   }
   return expanded;
 }
@@ -329,21 +361,66 @@ function ComposerView(props: {
     );
 
   return (
-    <Box backgroundColor="#202020" paddingX={1}>
-      <Text color={prefixColor}>
-        {props.label}
-        {"> "}
-      </Text>
-      {content}
+    <Box backgroundColor="#202020" paddingX={1} flexDirection="row">
+      <Box marginRight={1} flexShrink={0}>
+        <Text color={prefixColor}>
+          {props.label}
+          {">"}
+        </Text>
+      </Box>
+      <Box flexGrow={1} flexShrink={1}>
+        {content}
+      </Box>
     </Box>
   );
+}
+
+function wrapTranscriptText(text: string, width: number): string[] {
+  const safeWidth = Math.max(1, width);
+  const paragraphs = text.length > 0 ? text.split(/\r\n|\r|\n/) : [""];
+  return paragraphs.flatMap((paragraph) => {
+    const wrapped = wrapAnsi(paragraph.length > 0 ? paragraph : " ", safeWidth, {
+      hard: true,
+      trim: false,
+      wordWrap: false,
+    }).split("\n");
+    return wrapped.length > 0 ? wrapped : [""];
+  });
+}
+
+function buildTranscriptLines(panel: PanelState, width: number): TranscriptLine[] {
+  const safeWidth = Math.max(8, width);
+  const lines: TranscriptLine[] = [];
+
+  for (const [index, entry] of panel.entries.entries()) {
+    const prefix = entry.role === "user" ? "> " : "";
+    const prefixWidth = stringWidth(prefix);
+    const continuationPrefix = " ".repeat(prefixWidth);
+    const wrappedContent = wrapTranscriptText(entry.displayText ?? entry.text, safeWidth - prefixWidth);
+
+    wrappedContent.forEach((line, lineIndex) => {
+      lines.push({
+        role: entry.role,
+        text: `${lineIndex === 0 ? prefix : continuationPrefix}${line}`,
+      });
+    });
+
+    if (index < panel.entries.length - 1) {
+      lines.push({
+        role: "system",
+        text: "",
+      });
+    }
+  }
+
+  return lines;
 }
 
 function PanelView(props: {
   panel: PanelState;
   animationFrame: number;
+  contentWidth: number;
   globalPlanMode: boolean;
-  scrollOffset: number;
   composerActive: boolean;
   onComposerChange: (value: string) => void;
   onComposerSubmit: (value: string) => void;
@@ -355,11 +432,10 @@ function PanelView(props: {
       ? runningPalette[props.animationFrame % runningPalette.length] ?? providerAccentColor(props.panel.provider)
       : providerAccentColor(props.panel.provider);
   const statusColor = locked ? "gray" : props.panel.status === "running" ? "yellow" : props.panel.status === "error" ? "red" : "gray";
-  const maxOffset = Math.max(0, props.panel.entries.length - 6);
-  const boundedOffset = Math.min(props.scrollOffset, maxOffset);
-  const sliceEnd = props.panel.entries.length - boundedOffset;
-  const sliceStart = Math.max(0, sliceEnd - 6);
-  const visibleEntries = props.panel.entries.slice(sliceStart, sliceEnd);
+  const visibleLines = useMemo(
+    () => buildTranscriptLines(props.panel, props.contentWidth),
+    [props.contentWidth, props.panel],
+  );
   const emptyMessage = locked
     ? props.panel.lockMessage ?? "This panel is disabled."
     : props.panel.worktreePath
@@ -367,13 +443,36 @@ function PanelView(props: {
       : "Waiting for a prompt.";
 
   return (
-    <Box flexGrow={1} paddingX={1} flexDirection="column">
+    <Box flexGrow={1} flexBasis={0} paddingX={1} flexDirection="column" justifyContent="flex-end" alignSelf="flex-end">
       <Text bold={!locked} dimColor={locked}>
         <Text color={accentColor}>{props.panel.title}</Text>
         <Text color={statusColor}> · {statusLabel(props.panel.status)}</Text>
         <Text color="gray"> · {effectivePlanMode(props.globalPlanMode, props.panel) ? "plan" : "normal"}</Text>
-        {boundedOffset > 0 ? <Text color="gray"> · scroll {boundedOffset}</Text> : null}
       </Text>
+      <Box flexDirection="column" marginTop={1}>
+        {visibleLines.length === 0 ? <Text dimColor>{emptyMessage}</Text> : null}
+        {visibleLines.map((line, index) => {
+          if (line.role === "user") {
+            return (
+              <Text key={`${props.panel.provider}-line-${index}`} color="cyan" dimColor={locked}>
+                {line.text}
+              </Text>
+            );
+          }
+          if (line.role === "assistant") {
+            return (
+              <Text key={`${props.panel.provider}-line-${index}`} dimColor={locked}>
+                {line.text}
+              </Text>
+            );
+          }
+          return (
+            <Text key={`${props.panel.provider}-line-${index}`} color="gray" dimColor>
+              {line.text}
+            </Text>
+          );
+        })}
+      </Box>
       <Box marginTop={1}>
         <ComposerView
           label={props.panel.title.toLowerCase()}
@@ -385,43 +484,26 @@ function PanelView(props: {
           onSubmit={props.onComposerSubmit}
         />
       </Box>
-      <Box flexDirection="column" marginTop={1}>
-        {visibleEntries.length === 0 ? <Text dimColor>{emptyMessage}</Text> : null}
-        {visibleEntries.map((entry, index) => (
-          <Box key={`${props.panel.provider}-${entry.timestamp}-${index}`} flexDirection="column" marginBottom={1}>
-            {entry.role === "user" ? (
-              <Text color="cyan" dimColor={locked}>
-                {"> "}
-                {entry.displayText ?? entry.text}
-              </Text>
-            ) : entry.role === "assistant" ? (
-              <Text dimColor={locked}>{entry.displayText ?? entry.text}</Text>
-            ) : (
-              <Text color="gray" dimColor>
-                {entry.displayText ?? entry.text}
-              </Text>
-            )}
-          </Box>
-        ))}
-      </Box>
     </Box>
   );
 }
 
 function App({ cwd }: AppProps) {
   const { exit } = useApp();
+  const { stdout } = useStdout();
   const worktreeSetup = useMemo<WorktreeSetup>(() => ensurePanelWorktrees(cwd), [cwd]);
   const [planMode, setPlanMode] = useState(false);
   const [sharedInput, setSharedInput] = useState("");
   const [activeComposer, setActiveComposer] = useState<ComposerTarget>("shared");
   const [notice, setNotice] = useState<string | undefined>(worktreeSetup.error);
   const [animationFrame, setAnimationFrame] = useState(0);
-  const [panelScrollOffsets, setPanelScrollOffsets] = useState<Record<ProviderId, number>>({
-    codex: 0,
-    claude: 0,
-    gemini: 0,
-  });
-  const [collapsedPastes, setCollapsedPastes] = useState<Partial<Record<ComposerTarget, CollapsedPaste[]>>>({});
+  const [pastedTextRefs, setPastedTextRefs] = useState<Partial<Record<ComposerTarget, Record<number, PastedTextRef>>>>(
+    {},
+  );
+  const [terminalSize, setTerminalSize] = useState(() => ({
+    columns: stdout.columns ?? process.stdout.columns ?? 120,
+    rows: stdout.rows ?? process.stdout.rows ?? 24,
+  }));
   const [panels, setPanels] = useState<Record<ProviderId, PanelState>>(() => {
     const auths = getAuthStatuses();
     return {
@@ -433,10 +515,18 @@ function App({ cwd }: AppProps) {
 
   const panelsRef = useRef(panels);
   const planModeRef = useRef(planMode);
+  const composerValueRef = useRef<Record<ComposerTarget, string>>({
+    codex: "",
+    claude: "",
+    gemini: "",
+    shared: "",
+  });
+  const pastedTextRefsRef = useRef<Partial<Record<ComposerTarget, Record<number, PastedTextRef>>>>({});
   const activeTurnsRef = useRef<Map<string, ProviderTurnHandle>>(new Map());
   const fusionBundleRef = useRef<ResultBundle | undefined>(undefined);
   const escapeArmedAtRef = useRef<number | undefined>(undefined);
   const noticeTimerRef = useRef<NodeJS.Timeout | undefined>(undefined);
+  const panelContentWidthRef = useRef(26);
 
   useEffect(() => {
     panelsRef.current = panels;
@@ -445,6 +535,19 @@ function App({ cwd }: AppProps) {
   useEffect(() => {
     planModeRef.current = planMode;
   }, [planMode]);
+
+  useEffect(() => {
+    composerValueRef.current = {
+      codex: panels.codex.composerText,
+      claude: panels.claude.composerText,
+      gemini: panels.gemini.composerText,
+      shared: sharedInput,
+    };
+  }, [panels, sharedInput]);
+
+  useEffect(() => {
+    pastedTextRefsRef.current = pastedTextRefs;
+  }, [pastedTextRefs]);
 
   useEffect(() => {
     return () => {
@@ -483,6 +586,30 @@ function App({ cwd }: AppProps) {
       setActiveComposer("shared");
     }
   }, [activeComposer, panels]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      setTerminalSize({
+        columns: stdout.columns ?? process.stdout.columns ?? 120,
+        rows: stdout.rows ?? process.stdout.rows ?? 24,
+      });
+    };
+
+    handleResize();
+    stdout.on("resize", handleResize);
+    return () => {
+      stdout.off("resize", handleResize);
+    };
+  }, [stdout]);
+
+  const panelContentWidth = useMemo(() => {
+    const totalColumns = terminalSize.columns || 120;
+    return Math.max(20, Math.floor((totalColumns - 8) / 3) - 2);
+  }, [terminalSize.columns]);
+
+  useEffect(() => {
+    panelContentWidthRef.current = panelContentWidth;
+  }, [panelContentWidth]);
 
   useEffect(() => {
     const payload: PersistedSession = {
@@ -554,7 +681,7 @@ function App({ cwd }: AppProps) {
   }
 
   function clearPanels(scope: ComposerTarget): void {
-    setCollapsedPastes((current) => {
+    setPastedTextRefs((current) => {
       if (scope === "shared") {
         return {};
       }
@@ -613,30 +740,7 @@ function App({ cwd }: AppProps) {
     showNotice("Stopping all running agents...");
   }
 
-  function adjustPanelScroll(provider: ProviderId, delta: number): void {
-    setPanelScrollOffsets((current) => {
-      const entryCount = panelsRef.current[provider].entries.length;
-      const maxOffset = Math.max(0, entryCount - 1);
-      const nextOffset = Math.max(0, Math.min(maxOffset, current[provider] + delta));
-      return {
-        ...current,
-        [provider]: nextOffset,
-      };
-    });
-  }
-
   useInput((value, key) => {
-    if (activeComposer !== "shared") {
-      if (key.pageUp || (key.shift && key.upArrow)) {
-        adjustPanelScroll(activeComposer, 1);
-        return;
-      }
-      if (key.pageDown || (key.shift && key.downArrow)) {
-        adjustPanelScroll(activeComposer, -1);
-        return;
-      }
-    }
-
     if (key.tab) {
       setActiveComposer((current) => nextComposerTarget(current, panelsRef.current, key.shift ? -1 : 1));
       return;
@@ -668,6 +772,10 @@ function App({ cwd }: AppProps) {
   });
 
   function setComposerDisplayValue(target: ComposerTarget, value: string): void {
+    composerValueRef.current = {
+      ...composerValueRef.current,
+      [target]: value,
+    };
     if (target === "shared") {
       setSharedInput(value);
       return;
@@ -681,8 +789,23 @@ function App({ cwd }: AppProps) {
     }));
   }
 
+  function nextPastedTextRefId(target: ComposerTarget): number {
+    const currentRefs = pastedTextRefsRef.current[target];
+    if (!currentRefs) {
+      return 1;
+    }
+    const ids = Object.keys(currentRefs)
+      .map((key) => Number.parseInt(key, 10))
+      .filter((id) => Number.isFinite(id));
+    return ids.length === 0 ? 1 : Math.max(...ids) + 1;
+  }
+
   function clearComposerDraft(target: ComposerTarget): void {
-    setCollapsedPastes((current) => ({
+    pastedTextRefsRef.current = {
+      ...pastedTextRefsRef.current,
+      [target]: undefined,
+    };
+    setPastedTextRefs((current) => ({
       ...current,
       [target]: undefined,
     }));
@@ -691,27 +814,42 @@ function App({ cwd }: AppProps) {
 
   function resolveComposerSubmission(target: ComposerTarget, submittedValue: string): { raw: string; display: string } {
     return {
-      raw: expandCollapsedPastes(submittedValue, collapsedPastes[target]),
+      raw: expandPastedTextRefs(submittedValue, pastedTextRefsRef.current[target]),
       display: submittedValue,
     };
   }
 
   function handleComposerChange(target: ComposerTarget, nextValue: string): void {
-    const currentValue = target === "shared" ? sharedInput : panelsRef.current[target].composerText;
-    const retained = retainCollapsedPastes(collapsedPastes[target], nextValue);
-    const nextCollapsed = maybeCollapsePastedContent(currentValue, nextValue);
-    const nextCollapsedPastes = nextCollapsed ? [...retained, nextCollapsed] : retained;
-    setCollapsedPastes((current) => ({
-      ...current,
-      [target]: nextCollapsedPastes.length > 0 ? nextCollapsedPastes : undefined,
-    }));
+    const currentValue = composerValueRef.current[target];
+    const retained = retainPastedTextRefs(pastedTextRefsRef.current[target], nextValue);
+    const nextCollapsed = maybeCollapsePastedContent(currentValue, nextValue, nextPastedTextRefId(target));
 
     if (!nextCollapsed) {
+      pastedTextRefsRef.current = {
+        ...pastedTextRefsRef.current,
+        [target]: Object.keys(retained).length > 0 ? retained : undefined,
+      };
+      setPastedTextRefs((current) => ({
+        ...current,
+        [target]: Object.keys(retained).length > 0 ? retained : undefined,
+      }));
       setComposerDisplayValue(target, nextValue);
       return;
     }
 
     const insertion = describeInsertedSegment(currentValue, nextValue);
+    const nextRefs = {
+      ...retained,
+      [nextCollapsed.id]: nextCollapsed,
+    };
+    pastedTextRefsRef.current = {
+      ...pastedTextRefsRef.current,
+      [target]: nextRefs,
+    };
+    setPastedTextRefs((current) => ({
+      ...current,
+      [target]: nextRefs,
+    }));
     setComposerDisplayValue(target, `${insertion.prefix}${nextCollapsed.placeholder}${insertion.suffix}`);
   }
 
@@ -742,11 +880,6 @@ function App({ cwd }: AppProps) {
         entries: [...current[provider].entries, makeEntry("user", prompt, options.displayPrompt ?? prompt)],
       },
     }));
-    setPanelScrollOffsets((current) => ({
-      ...current,
-      [provider]: 0,
-    }));
-
     const result = await handle.promise;
     activeTurnsRef.current.delete(trackingKey);
 
@@ -956,7 +1089,7 @@ function App({ cwd }: AppProps) {
           target === "shared" ? appendSystemAll("No saved TripleAgent session found.") : appendSystem(target, "No saved TripleAgent session found.");
           return;
         }
-        setCollapsedPastes({});
+        setPastedTextRefs({});
         const auths = getAuthStatuses();
         setPlanMode(session.planMode);
         setPanels({
@@ -1098,14 +1231,14 @@ function App({ cwd }: AppProps) {
         Claude harness shell · Ready panels: {readyCount}/3 · Mode: {planMode ? "PLAN" : "NORMAL"} · CWD: {cwd}
       </Text>
       {notice ? <Text color="yellow">{notice}</Text> : null}
-      <Box marginTop={1}>
+      <Box marginTop={1} alignItems="flex-end">
         {PROVIDERS.map((provider, index) => (
           <React.Fragment key={provider}>
             <PanelView
               panel={panels[provider]}
               animationFrame={animationFrame}
+              contentWidth={panelContentWidth}
               globalPlanMode={planMode}
-              scrollOffset={panelScrollOffsets[provider]}
               composerActive={activeComposer === provider}
               onComposerChange={(value) => handleComposerChange(provider, value)}
               onComposerSubmit={(value) => submitPanel(provider, value)}
@@ -1136,7 +1269,7 @@ function App({ cwd }: AppProps) {
           onSubmit={submitShared}
         />
       </Box>
-      <Text color="gray">Tab focus · Shift+Up/Down scroll active panel · Shared: /help /status /plan /init /clear /resume /pick /fuse · Esc Esc stops all</Text>
+      <Text color="gray">Tab focus · Panels stack upward from the bottom · Shared: /help /status /plan /init /clear /resume /pick /fuse · Esc Esc stops all</Text>
     </Box>
   );
 }
