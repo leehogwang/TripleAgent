@@ -280,6 +280,35 @@ function parseClaudeJson(output: string): string {
   return trimmed;
 }
 
+function parseGeminiJson(output: string): string {
+  const trimmed = sanitizeGeminiText(output);
+  if (!trimmed) {
+    return "";
+  }
+
+  for (const line of trimmed.split("\n").reverse()) {
+    const candidate = line.trim();
+    if (!candidate.startsWith("{")) {
+      continue;
+    }
+    try {
+      const payload = JSON.parse(candidate) as { response?: string };
+      if (payload.response) {
+        return payload.response.trim();
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  try {
+    const payload = JSON.parse(trimmed) as { response?: string };
+    return payload.response?.trim() ?? trimmed;
+  } catch {
+    return trimmed;
+  }
+}
+
 function normalizeProviderResult(command: string, args: string[], result: ProcessResult): ProviderRunResult {
   const provider = inferProvider(command, args);
 
@@ -313,7 +342,7 @@ function normalizeProviderResult(command: string, args: string[], result: Proces
     const lockout = detectLockout(provider, output);
     return {
       ok: result.code === 0 && !lockout.lockReason,
-      text: sanitizeGeminiText(result.stdout) || output || "(empty response)",
+      text: parseGeminiJson(result.stdout) || output || "(empty response)",
       rawOutput: output,
       interrupted: false,
       lockReason: lockout.lockReason,
@@ -367,7 +396,7 @@ export function startProviderTurn(args: ProviderRunArgs): ProviderTurnHandle {
   }
 
   if (args.provider === "gemini") {
-    const cliArgs = ["-p", bridgedPrompt, "--output-format", "text"];
+    const cliArgs = ["-p", bridgedPrompt, "--output-format", "json"];
     if (args.planMode) {
       cliArgs.push("--approval-mode", "plan");
     }

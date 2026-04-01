@@ -11,6 +11,7 @@ export type TranscriptRole = "system" | "user" | "assistant";
 export type TranscriptEntry = {
   role: TranscriptRole;
   text: string;
+  displayText?: string;
   timestamp: string;
 };
 

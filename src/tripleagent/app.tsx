@@ -2,10 +2,10 @@ import { randomUUID } from "node:crypto";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, render, Text, useApp, useInput } from "ink";
-import TextInput from "ink-text-input";
 
 import { getAuthStatuses } from "./auth.js";
 import { buildHelpText, parseSlashCommand } from "./commands.js";
+import { HarnessTextInput } from "./HarnessTextInput.js";
 import { loadPersistedSession, savePersistedSession } from "./persistence.js";
 import { startProviderTurn, type ProviderTurnHandle } from "./providers.js";
 import {
@@ -35,11 +35,11 @@ type RunTurnOptions = {
   trackingKey?: string;
   overrideCwd?: string;
   persistBundle?: boolean;
+  displayPrompt?: string;
 };
 
 type CollapsedPaste = {
   raw: string;
-  display: string;
   placeholder: string;
 };
 
@@ -69,8 +69,13 @@ function panelTitle(provider: ProviderId): string {
   }
 }
 
-function makeEntry(role: TranscriptEntry["role"], text: string): TranscriptEntry {
-  return { role, text, timestamp: now() };
+function makeEntry(role: TranscriptEntry["role"], text: string, displayText?: string): TranscriptEntry {
+  return {
+    role,
+    text,
+    timestamp: now(),
+    ...(displayText === undefined ? {} : { displayText }),
+  };
 }
 
 function countLineBreaks(text: string): number {
@@ -128,10 +133,46 @@ function maybeCollapsePastedContent(previousValue: string, nextValue: string): C
 
   const placeholder = buildPastedContentPlaceholder(insertion.inserted.length);
   return {
-    raw: nextValue,
-    display: `${insertion.prefix}${placeholder}${insertion.suffix}`,
+    raw: insertion.inserted,
     placeholder,
   };
+}
+
+function retainCollapsedPastes(previous: CollapsedPaste[] | undefined, nextValue: string): CollapsedPaste[] {
+  if (!previous || previous.length === 0) {
+    return [];
+  }
+  const retained: CollapsedPaste[] = [];
+  let searchOffset = 0;
+  for (const collapsed of previous) {
+    const matchIndex = nextValue.indexOf(collapsed.placeholder, searchOffset);
+    if (matchIndex === -1) {
+      continue;
+    }
+    retained.push(collapsed);
+    searchOffset = matchIndex + collapsed.placeholder.length;
+  }
+  return retained;
+}
+
+function expandCollapsedPastes(value: string, collapsed: CollapsedPaste[] | undefined): string {
+  if (!collapsed || collapsed.length === 0) {
+    return value;
+  }
+  let expanded = value;
+  let searchOffset = 0;
+  for (const item of collapsed) {
+    const matchIndex = expanded.indexOf(item.placeholder, searchOffset);
+    if (matchIndex === -1) {
+      continue;
+    }
+    expanded =
+      expanded.slice(0, matchIndex) +
+      item.raw +
+      expanded.slice(matchIndex + item.placeholder.length);
+    searchOffset = matchIndex + item.raw.length;
+  }
+  return expanded;
 }
 
 function quotaLockMessage(provider: ProviderId): string {
@@ -274,7 +315,13 @@ function ComposerView(props: {
   const prefixColor = props.locked ? "gray" : props.active ? "white" : "gray";
   const content =
     props.active && !props.locked ? (
-      <TextInput value={props.value} onChange={props.onChange} onSubmit={props.onSubmit} />
+      <HarnessTextInput
+        value={props.value}
+        placeholder={props.placeholder}
+        focus={props.active && !props.locked}
+        onChange={props.onChange}
+        onSubmit={props.onSubmit}
+      />
     ) : (
       <Text color={props.value ? "white" : "gray"} dimColor={props.locked}>
         {props.value || props.placeholder}
@@ -342,10 +389,18 @@ function PanelView(props: {
         {visibleEntries.length === 0 ? <Text dimColor>{emptyMessage}</Text> : null}
         {visibleEntries.map((entry, index) => (
           <Box key={`${props.panel.provider}-${entry.timestamp}-${index}`} flexDirection="column" marginBottom={1}>
-            <Text color={entry.role === "assistant" ? "green" : entry.role === "user" ? "cyan" : "yellow"} dimColor={locked}>
-              [{entry.timestamp}] {entry.role}
-            </Text>
-            <Text dimColor={locked}>{entry.text}</Text>
+            {entry.role === "user" ? (
+              <Text color="cyan" dimColor={locked}>
+                {"> "}
+                {entry.displayText ?? entry.text}
+              </Text>
+            ) : entry.role === "assistant" ? (
+              <Text dimColor={locked}>{entry.displayText ?? entry.text}</Text>
+            ) : (
+              <Text color="gray" dimColor>
+                {entry.displayText ?? entry.text}
+              </Text>
+            )}
           </Box>
         ))}
       </Box>
@@ -366,18 +421,9 @@ function App({ cwd }: AppProps) {
     claude: 0,
     gemini: 0,
   });
-  const [collapsedPastes, setCollapsedPastes] = useState<Partial<Record<ComposerTarget, CollapsedPaste>>>({});
+  const [collapsedPastes, setCollapsedPastes] = useState<Partial<Record<ComposerTarget, CollapsedPaste[]>>>({});
   const [panels, setPanels] = useState<Record<ProviderId, PanelState>>(() => {
     const auths = getAuthStatuses();
-    const restored = loadPersistedSession();
-    const persisted = restored?.cwd === cwd ? restored : undefined;
-    if (persisted) {
-      return {
-        codex: buildPanelState("codex", auths.codex, worktreeSetup.panelWorktrees.codex, persisted.panels.codex),
-        claude: buildPanelState("claude", auths.claude, worktreeSetup.panelWorktrees.claude, persisted.panels.claude),
-        gemini: buildPanelState("gemini", auths.gemini, worktreeSetup.panelWorktrees.gemini, persisted.panels.gemini),
-      };
-    }
     return {
       codex: buildPanelState("codex", auths.codex, worktreeSetup.panelWorktrees.codex),
       claude: buildPanelState("claude", auths.claude, worktreeSetup.panelWorktrees.claude),
@@ -643,41 +689,30 @@ function App({ cwd }: AppProps) {
     setComposerDisplayValue(target, "");
   }
 
-  function resolveComposerSubmission(target: ComposerTarget, submittedValue: string): string {
-    const collapsed = collapsedPastes[target];
-    if (collapsed && submittedValue === collapsed.display) {
-      return collapsed.raw;
-    }
-    return submittedValue;
+  function resolveComposerSubmission(target: ComposerTarget, submittedValue: string): { raw: string; display: string } {
+    return {
+      raw: expandCollapsedPastes(submittedValue, collapsedPastes[target]),
+      display: submittedValue,
+    };
   }
 
   function handleComposerChange(target: ComposerTarget, nextValue: string): void {
     const currentValue = target === "shared" ? sharedInput : panelsRef.current[target].composerText;
-    const collapsed = collapsedPastes[target];
-
-    if (collapsed) {
-      if (nextValue === collapsed.display) {
-        return;
-      }
-      setCollapsedPastes((current) => ({
-        ...current,
-        [target]: undefined,
-      }));
-      setComposerDisplayValue(target, nextValue);
-      return;
-    }
-
+    const retained = retainCollapsedPastes(collapsedPastes[target], nextValue);
     const nextCollapsed = maybeCollapsePastedContent(currentValue, nextValue);
+    const nextCollapsedPastes = nextCollapsed ? [...retained, nextCollapsed] : retained;
+    setCollapsedPastes((current) => ({
+      ...current,
+      [target]: nextCollapsedPastes.length > 0 ? nextCollapsedPastes : undefined,
+    }));
+
     if (!nextCollapsed) {
       setComposerDisplayValue(target, nextValue);
       return;
     }
 
-    setCollapsedPastes((current) => ({
-      ...current,
-      [target]: nextCollapsed,
-    }));
-    setComposerDisplayValue(target, nextCollapsed.display);
+    const insertion = describeInsertedSegment(currentValue, nextValue);
+    setComposerDisplayValue(target, `${insertion.prefix}${nextCollapsed.placeholder}${insertion.suffix}`);
   }
 
   async function runTurn(provider: ProviderId, prompt: string, options: RunTurnOptions = {}): Promise<void> {
@@ -704,7 +739,7 @@ function App({ cwd }: AppProps) {
         ...current[provider],
         status: "running",
         lastError: undefined,
-        entries: [...current[provider].entries, makeEntry("user", prompt)],
+        entries: [...current[provider].entries, makeEntry("user", prompt, options.displayPrompt ?? prompt)],
       },
     }));
     setPanelScrollOffsets((current) => ({
@@ -986,7 +1021,7 @@ function App({ cwd }: AppProps) {
 
   async function submitShared(value: string): Promise<void> {
     const submittedValue = resolveComposerSubmission("shared", value);
-    const line = submittedValue.trim();
+    const line = submittedValue.raw.trim();
     if (!line) {
       return;
     }
@@ -1008,7 +1043,7 @@ function App({ cwd }: AppProps) {
 
     if (hasRunningPanels) {
       showNotice("Wait for the current run to finish before sending another shared prompt.");
-      setComposerDisplayValue("shared", line);
+      setComposerDisplayValue("shared", submittedValue.display);
       return;
     }
 
@@ -1018,12 +1053,12 @@ function App({ cwd }: AppProps) {
       return;
     }
 
-    await Promise.allSettled(runnable.map((provider) => runTurn(provider, line)));
+    await Promise.allSettled(runnable.map((provider) => runTurn(provider, line, { displayPrompt: submittedValue.display.trim() })));
   }
 
   async function submitPanel(provider: ProviderId, value: string): Promise<void> {
     const submittedValue = resolveComposerSubmission(provider, value);
-    const line = submittedValue.trim();
+    const line = submittedValue.raw.trim();
     if (!line) {
       return;
     }
@@ -1047,11 +1082,11 @@ function App({ cwd }: AppProps) {
 
     if (hasRunningPanels) {
       showNotice("Wait for the current run to finish before sending another prompt.");
-      setComposerDisplayValue(provider, line);
+      setComposerDisplayValue(provider, submittedValue.display);
       return;
     }
 
-    await runTurn(provider, line);
+    await runTurn(provider, line, { displayPrompt: submittedValue.display.trim() });
   }
 
   return (
