@@ -54,6 +54,94 @@ export function openAICompatibleMessagesToResponsesInput(messages) {
   return input;
 }
 
+export function findLatestResponsesContinuation(messages, responseIdByCallId) {
+  const sourceMessages = Array.isArray(messages) ? messages : [];
+
+  for (let index = sourceMessages.length - 1; index >= 0; index -= 1) {
+    const message = sourceMessages[index];
+    if (!isRecord(message) || !Array.isArray(message.content)) {
+      continue;
+    }
+
+    const toolResultIds = message.content
+      .filter((part) => isRecord(part) && part.type === "tool_result" && typeof part.tool_use_id === "string")
+      .map((part) => part.tool_use_id);
+
+    if (toolResultIds.length === 0) {
+      continue;
+    }
+
+    const previousResponseId = toolResultIds
+      .map((toolResultId) => responseIdByCallId.get(toolResultId))
+      .find((responseId) => typeof responseId === "string" && responseId.length > 0);
+
+    if (!previousResponseId) {
+      return {
+        previousResponseId: null,
+        messages: sourceMessages,
+      };
+    }
+
+    return {
+      previousResponseId,
+      messages: sourceMessages.slice(index),
+    };
+  }
+
+  return {
+    previousResponseId: null,
+    messages: sourceMessages,
+  };
+}
+
+export function sliceResponsesInputToLatestToolTurn(input) {
+  const items = Array.isArray(input) ? input : [];
+  let trailingOutputStart = -1;
+
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (isRecord(item) && item.type === "function_call_output" && typeof item.call_id === "string") {
+      trailingOutputStart = index;
+      continue;
+    }
+
+    if (trailingOutputStart !== -1) {
+      break;
+    }
+  }
+
+  if (trailingOutputStart === -1) {
+    return items;
+  }
+
+  const trailingCallIds = new Set(
+    items
+      .slice(trailingOutputStart)
+      .filter((item) => isRecord(item) && item.type === "function_call_output" && typeof item.call_id === "string")
+      .map((item) => item.call_id),
+  );
+
+  let startIndex = trailingOutputStart;
+  for (let index = trailingOutputStart - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!isRecord(item)) {
+      continue;
+    }
+
+    if (item.type === "function_call" && typeof item.call_id === "string" && trailingCallIds.has(item.call_id)) {
+      startIndex = index;
+      continue;
+    }
+
+    if (item.type === "message") {
+      startIndex = index;
+      break;
+    }
+  }
+
+  return items.slice(startIndex);
+}
+
 export function openAICompatibleToolsToResponsesTools(tools) {
   return (tools ?? [])
     .map((tool) => {
@@ -73,8 +161,14 @@ export function openAICompatibleToolsToResponsesTools(tools) {
 }
 
 export function parseResponsesSseToAnthropicContent(sseText) {
+  return parseResponsesSseToResult(sseText).content;
+}
+
+export function parseResponsesSseToResult(sseText) {
   const blocks = [];
+  const toolCallIds = [];
   const textByMessageId = new Map();
+  let responseId = null;
 
   for (const event of parseSseJsonEvents(sseText)) {
     const type = typeof event.type === "string" ? event.type : "";
@@ -83,6 +177,11 @@ export function parseResponsesSseToAnthropicContent(sseText) {
       const itemId = typeof event.item_id === "string" ? event.item_id : `msg_${randomUUID()}`;
       const delta = typeof event.delta === "string" ? event.delta : "";
       textByMessageId.set(itemId, (textByMessageId.get(itemId) ?? "") + delta);
+      continue;
+    }
+
+    if (type === "response.completed" && isRecord(event.response) && typeof event.response.id === "string") {
+      responseId = event.response.id;
       continue;
     }
 
@@ -131,10 +230,19 @@ export function parseResponsesSseToAnthropicContent(sseText) {
         name: typeof item.name === "string" ? item.name : "tool",
         input,
       });
+      if (typeof item.call_id === "string") {
+        toolCallIds.push(item.call_id);
+      }
+      continue;
     }
+
   }
 
-  return blocks.length > 0 ? blocks : [{ type: "text", text: "", citations: null }];
+  return {
+    responseId,
+    toolCallIds,
+    content: blocks.length > 0 ? blocks : [{ type: "text", text: "", citations: null }],
+  };
 }
 
 function parseSseJsonEvents(sseText) {

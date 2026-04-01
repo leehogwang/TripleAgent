@@ -68,8 +68,8 @@ Provider-specific requirements:
 - Anthropic
   - an Anthropic account for in-app login, or `ANTHROPIC_API_KEY`
 - OpenAI
-  - `codex login` if you want to reuse your ChatGPT/Codex OAuth session from `~/.codex/auth.json`
-  - or `OPENAI_API_KEY` as a fallback
+  - `OPENAI_API_KEY`
+  - or `codex login` if you want to reuse your ChatGPT/Codex OAuth session from `~/.codex/auth.json` as an experimental fallback
 - Gemini
   - `GEMINI_API_KEY`
 - Groq
@@ -188,7 +188,7 @@ After you choose a provider, Claw Dev also lets you enter any model id you want 
 - `openai/o4-mini`
 - `qwen2.5-coder:14b`
 
-Claw Dev also narrows the bundled in-app `/model` picker to provider-relevant models for the current session, while still allowing any custom model id through `--model`.
+Claw Dev also narrows the bundled in-app `/model` picker to the provider-relevant model set for the current session where possible. Some labels may still reflect provider-specific naming, and any custom model id is still allowed through `--model`.
 
 ## Additional Cloud Provider Setup
 
@@ -222,7 +222,7 @@ OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_MODEL=gpt-5.4
 ```
 
-If `~/.codex/auth.json` exists, Claw Dev can reuse that ChatGPT/Codex login as an experimental fallback. Example placeholder values such as `your_openai_api_key_here` are ignored. Keyring-backed Codex auth is not supported yet.
+If `~/.codex/auth.json` exists, Claw Dev can reuse that ChatGPT/Codex login as an experimental fallback. Example placeholder values such as `your_openai_api_key_here` are ignored. The in-app `/model` picker is filtered toward the active provider where possible, but provider-specific labels may still appear. Keyring-backed Codex auth is not supported yet.
 
 ## How To Use Ollama With Claw Dev
 

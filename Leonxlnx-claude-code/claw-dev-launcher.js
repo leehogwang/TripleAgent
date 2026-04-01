@@ -203,7 +203,9 @@ async function configureAnthropic(env, rl) {
 
 async function configureCompatProvider(provider, env, rl, modelArg) {
   env.ANTHROPIC_COMPAT_PROVIDER = provider;
-  env.ANTHROPIC_COMPAT_PORT = env.ANTHROPIC_COMPAT_PORT || defaultPorts[provider];
+  const configuredPort = env.ANTHROPIC_COMPAT_PORT?.trim();
+  env.CLAW_COMPAT_PORT_EXPLICIT = configuredPort && configuredPort !== defaultPorts[provider] ? "1" : "0";
+  env.ANTHROPIC_COMPAT_PORT = configuredPort || defaultPorts[provider];
 
   switch (provider) {
     case "openai": {
@@ -218,7 +220,7 @@ async function configureCompatProvider(provider, env, rl, modelArg) {
         process.stdout.write("\nUsing OPENAI_API_KEY from the current environment.\n");
       }
 
-      if (!env.OPENAI_AUTH_TOKEN?.trim() && !env.OPENAI_API_KEY?.trim()) {
+      if (auth.status !== "ok") {
         const key = (await rl.question("Enter OPENAI_API_KEY (input is visible, fallback mode): ")).trim();
         if (!key) {
           throw new Error("OpenAI mode requires either a reusable Codex login or OPENAI_API_KEY.");
@@ -400,7 +402,13 @@ async function primeBundledModelPicker(provider, env) {
     ...currentConfig,
     additionalModelOptionsCache: nextOptions,
   };
-  fs.writeFileSync(configPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
+  try {
+    fs.writeFileSync(configPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
+  } catch (error) {
+    console.warn(`Could not write model picker cache in ${configPath}; skipping priming.`);
+    restoreModelPickerCache = null;
+    return;
+  }
 
   restoreModelPickerCache = () => {
     try {
@@ -524,33 +532,17 @@ async function ensureCompatProxy(provider, env) {
 }
 
 async function resolveCompatPort(provider, env) {
-  const preferredPort = String(env.ANTHROPIC_COMPAT_PORT || defaultPorts[provider]);
-  const preferredUrl = `http://127.0.0.1:${preferredPort}`;
-  const model = modelForProvider(provider, env);
-
-  if (await isHealthyProxy(preferredUrl, provider, model)) {
-    return preferredPort;
-  }
-
-  if (await canListenOnPort(preferredPort)) {
-    return preferredPort;
-  }
-
-  let candidate = Number.parseInt(preferredPort, 10) + 1;
-  for (let attempts = 0; attempts < 25; attempts += 1, candidate += 1) {
-    const candidatePort = String(candidate);
-    const candidateUrl = `http://127.0.0.1:${candidatePort}`;
-
-    if (await isHealthyProxy(candidateUrl, provider, model)) {
-      return candidatePort;
-    }
-
-    if (await canListenOnPort(candidatePort)) {
-      return candidatePort;
-    }
-  }
-
-  throw new Error(`Could not find a free compatibility proxy port starting from ${preferredPort}.`);
+  const helperUrl = pathToFileURL(path.join(workspaceRoot, "shared", "compatProxyPort.js")).href;
+  const { resolveCompatPortAssignment } = await import(helperUrl);
+  return resolveCompatPortAssignment({
+    preferredPort: String(env.ANTHROPIC_COMPAT_PORT || defaultPorts[provider]),
+    explicitPort: env.CLAW_COMPAT_PORT_EXPLICIT === "1",
+    provider,
+    model: modelForProvider(provider, env),
+    isHealthyProxy: (proxyUrl, candidateProvider, candidateModel) =>
+      isHealthyProxy(proxyUrl, candidateProvider, candidateModel),
+    canListenOnPort,
+  });
 }
 
 function modelForProvider(provider, env) {

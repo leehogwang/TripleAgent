@@ -7,7 +7,8 @@ import { formatOpenAIAuthHint, resolveOpenAIAuth } from "../shared/openaiAuth.js
 import {
   openAICompatibleMessagesToResponsesInput,
   openAICompatibleToolsToResponsesTools,
-  parseResponsesSseToAnthropicContent,
+  parseResponsesSseToResult,
+  sliceResponsesInputToLatestToolTurn,
 } from "../shared/openaiResponsesCompat.js";
 import { providerLabel, providerModelCatalog } from "../shared/providerModels.js";
 
@@ -421,7 +422,7 @@ async function runOpenAI(body: AnthropicMessageRequest, model: string): Promise<
 
   if (OPENAI_AUTH.authType === "oauth") {
     const instructions = systemInstruction || "You are a helpful assistant.";
-    const rawInput = openAICompatibleMessagesToResponsesInput(messages);
+    const rawInput = sliceResponsesInputToLatestToolTurn(openAICompatibleMessagesToResponsesInput(messages));
     const responseTools = openAICompatibleToolsToResponsesTools(tools);
     const compactRequest = compactOpenAIResponsesRequest(instructions, rawInput, responseTools);
     const response = await fetch("https://chatgpt.com/backend-api/codex/responses", {
@@ -458,7 +459,7 @@ async function runOpenAI(body: AnthropicMessageRequest, model: string): Promise<
       throw new Error(sseText);
     }
 
-    return parseResponsesSseToAnthropicContent(sseText) as AnthropicContentBlock[];
+    return parseResponsesSseToResult(sseText).content as AnthropicContentBlock[];
   }
 
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
