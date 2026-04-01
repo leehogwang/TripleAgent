@@ -37,8 +37,16 @@ type RunTurnOptions = {
   persistBundle?: boolean;
 };
 
+type CollapsedPaste = {
+  raw: string;
+  display: string;
+  placeholder: string;
+};
+
 const PROVIDERS: ProviderId[] = ["codex", "claude", "gemini"];
 const COMPOSER_ORDER: ComposerTarget[] = ["codex", "claude", "gemini", "shared"];
+const PASTE_COLLAPSE_THRESHOLD = 800;
+const PASTE_COLLAPSE_MAX_LINES = 2;
 
 const AUTH_LOCK_MESSAGE =
   "Authentication required. This panel is dimmed and excluded from normal broadcasts until login succeeds.";
@@ -63,6 +71,67 @@ function panelTitle(provider: ProviderId): string {
 
 function makeEntry(role: TranscriptEntry["role"], text: string): TranscriptEntry {
   return { role, text, timestamp: now() };
+}
+
+function countLineBreaks(text: string): number {
+  return (text.match(/\r\n|\r|\n/g) || []).length;
+}
+
+function buildPastedContentPlaceholder(charCount: number): string {
+  return `[Pasted Content ${charCount} chars]`;
+}
+
+function describeInsertedSegment(previousValue: string, nextValue: string): {
+  prefix: string;
+  inserted: string;
+  suffix: string;
+} {
+  let prefixLength = 0;
+  while (
+    prefixLength < previousValue.length &&
+    prefixLength < nextValue.length &&
+    previousValue[prefixLength] === nextValue[prefixLength]
+  ) {
+    prefixLength += 1;
+  }
+
+  let suffixLength = 0;
+  while (
+    suffixLength < previousValue.length - prefixLength &&
+    suffixLength < nextValue.length - prefixLength &&
+    previousValue[previousValue.length - 1 - suffixLength] === nextValue[nextValue.length - 1 - suffixLength]
+  ) {
+    suffixLength += 1;
+  }
+
+  return {
+    prefix: nextValue.slice(0, prefixLength),
+    inserted: nextValue.slice(prefixLength, nextValue.length - suffixLength),
+    suffix: nextValue.slice(nextValue.length - suffixLength),
+  };
+}
+
+function maybeCollapsePastedContent(previousValue: string, nextValue: string): CollapsedPaste | undefined {
+  if (nextValue.length <= previousValue.length) {
+    return undefined;
+  }
+
+  const insertion = describeInsertedSegment(previousValue, nextValue);
+  if (!insertion.inserted) {
+    return undefined;
+  }
+
+  const insertedLineBreaks = countLineBreaks(insertion.inserted);
+  if (insertion.inserted.length <= PASTE_COLLAPSE_THRESHOLD && insertedLineBreaks <= PASTE_COLLAPSE_MAX_LINES) {
+    return undefined;
+  }
+
+  const placeholder = buildPastedContentPlaceholder(insertion.inserted.length);
+  return {
+    raw: nextValue,
+    display: `${insertion.prefix}${placeholder}${insertion.suffix}`,
+    placeholder,
+  };
 }
 
 function quotaLockMessage(provider: ProviderId): string {
@@ -297,6 +366,7 @@ function App({ cwd }: AppProps) {
     claude: 0,
     gemini: 0,
   });
+  const [collapsedPastes, setCollapsedPastes] = useState<Partial<Record<ComposerTarget, CollapsedPaste>>>({});
   const [panels, setPanels] = useState<Record<ProviderId, PanelState>>(() => {
     const auths = getAuthStatuses();
     const restored = loadPersistedSession();
@@ -438,6 +508,15 @@ function App({ cwd }: AppProps) {
   }
 
   function clearPanels(scope: ComposerTarget): void {
+    setCollapsedPastes((current) => {
+      if (scope === "shared") {
+        return {};
+      }
+      return {
+        ...current,
+        [scope]: undefined,
+      };
+    });
     const auths = getAuthStatuses();
     setPanels((current) => {
       const next = { ...current };
@@ -541,6 +620,65 @@ function App({ cwd }: AppProps) {
       }
     }
   });
+
+  function setComposerDisplayValue(target: ComposerTarget, value: string): void {
+    if (target === "shared") {
+      setSharedInput(value);
+      return;
+    }
+    setPanels((current) => ({
+      ...current,
+      [target]: {
+        ...current[target],
+        composerText: value,
+      },
+    }));
+  }
+
+  function clearComposerDraft(target: ComposerTarget): void {
+    setCollapsedPastes((current) => ({
+      ...current,
+      [target]: undefined,
+    }));
+    setComposerDisplayValue(target, "");
+  }
+
+  function resolveComposerSubmission(target: ComposerTarget, submittedValue: string): string {
+    const collapsed = collapsedPastes[target];
+    if (collapsed && submittedValue === collapsed.display) {
+      return collapsed.raw;
+    }
+    return submittedValue;
+  }
+
+  function handleComposerChange(target: ComposerTarget, nextValue: string): void {
+    const currentValue = target === "shared" ? sharedInput : panelsRef.current[target].composerText;
+    const collapsed = collapsedPastes[target];
+
+    if (collapsed) {
+      if (nextValue === collapsed.display) {
+        return;
+      }
+      setCollapsedPastes((current) => ({
+        ...current,
+        [target]: undefined,
+      }));
+      setComposerDisplayValue(target, nextValue);
+      return;
+    }
+
+    const nextCollapsed = maybeCollapsePastedContent(currentValue, nextValue);
+    if (!nextCollapsed) {
+      setComposerDisplayValue(target, nextValue);
+      return;
+    }
+
+    setCollapsedPastes((current) => ({
+      ...current,
+      [target]: nextCollapsed,
+    }));
+    setComposerDisplayValue(target, nextCollapsed.display);
+  }
 
   async function runTurn(provider: ProviderId, prompt: string, options: RunTurnOptions = {}): Promise<void> {
     const snapshot = panelsRef.current[provider];
@@ -783,6 +921,7 @@ function App({ cwd }: AppProps) {
           target === "shared" ? appendSystemAll("No saved TripleAgent session found.") : appendSystem(target, "No saved TripleAgent session found.");
           return;
         }
+        setCollapsedPastes({});
         const auths = getAuthStatuses();
         setPlanMode(session.planMode);
         setPanels({
@@ -846,11 +985,12 @@ function App({ cwd }: AppProps) {
   }
 
   async function submitShared(value: string): Promise<void> {
-    const line = value.trim();
+    const submittedValue = resolveComposerSubmission("shared", value);
+    const line = submittedValue.trim();
     if (!line) {
       return;
     }
-    setSharedInput("");
+    clearComposerDraft("shared");
 
     const parsed = parseSlashCommand(line);
     if (parsed) {
@@ -868,7 +1008,7 @@ function App({ cwd }: AppProps) {
 
     if (hasRunningPanels) {
       showNotice("Wait for the current run to finish before sending another shared prompt.");
-      setSharedInput(line);
+      setComposerDisplayValue("shared", line);
       return;
     }
 
@@ -882,18 +1022,12 @@ function App({ cwd }: AppProps) {
   }
 
   async function submitPanel(provider: ProviderId, value: string): Promise<void> {
-    const line = value.trim();
+    const submittedValue = resolveComposerSubmission(provider, value);
+    const line = submittedValue.trim();
     if (!line) {
       return;
     }
-
-    setPanels((current) => ({
-      ...current,
-      [provider]: {
-        ...current[provider],
-        composerText: "",
-      },
-    }));
+    clearComposerDraft(provider);
 
     const parsed = parseSlashCommand(line);
     if (parsed) {
@@ -913,13 +1047,7 @@ function App({ cwd }: AppProps) {
 
     if (hasRunningPanels) {
       showNotice("Wait for the current run to finish before sending another prompt.");
-      setPanels((current) => ({
-        ...current,
-        [provider]: {
-          ...current[provider],
-          composerText: line,
-        },
-      }));
+      setComposerDisplayValue(provider, line);
       return;
     }
 
@@ -944,15 +1072,7 @@ function App({ cwd }: AppProps) {
               globalPlanMode={planMode}
               scrollOffset={panelScrollOffsets[provider]}
               composerActive={activeComposer === provider}
-              onComposerChange={(value) =>
-                setPanels((current) => ({
-                  ...current,
-                  [provider]: {
-                    ...current[provider],
-                    composerText: value,
-                  },
-                }))
-              }
+              onComposerChange={(value) => handleComposerChange(provider, value)}
               onComposerSubmit={(value) => submitPanel(provider, value)}
             />
             {index < PROVIDERS.length - 1 ? (
@@ -977,7 +1097,7 @@ function App({ cwd }: AppProps) {
           locked={false}
           value={sharedInput}
           placeholder="broadcast prompt or global command"
-          onChange={setSharedInput}
+          onChange={(value) => handleComposerChange("shared", value)}
           onSubmit={submitShared}
         />
       </Box>
