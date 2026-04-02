@@ -174,10 +174,65 @@ function sanitizeClaudeEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 
 function buildAdditionalAccessDirs(args: ProviderRunArgs): string[] {
   const current = path.resolve(args.cwd);
-  return [...new Set(args.accessDirs.map((value) => path.resolve(value)).filter((value) => value !== current))];
+  const normalized = args.accessDirs.map((value) => {
+    const resolved = path.resolve(value);
+    return path.extname(resolved) ? path.dirname(resolved) : resolved;
+  });
+  return [...new Set(normalized.filter((value) => value !== current))];
+}
+
+function summarizeProgressText(text: string, maxChars = 160): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= maxChars) {
+    return collapsed;
+  }
+  return `${collapsed.slice(0, maxChars - 3)}...`;
+}
+
+function parseCodexProgress(output: string): string | undefined {
+  let latestReasoning: string | undefined;
+  let latestMessage: string | undefined;
+  for (const line of output.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) {
+      continue;
+    }
+    try {
+      const payload = JSON.parse(trimmed) as {
+        item?: { type?: string; text?: string; message?: string };
+      };
+      if (payload.item?.type === "agent_message" && payload.item.text) {
+        latestMessage = summarizeProgressText(payload.item.text);
+      }
+      if (payload.item?.type === "reasoning" && payload.item.text) {
+        latestReasoning = summarizeProgressText(payload.item.text);
+      }
+    } catch {
+      continue;
+    }
+  }
+  if (latestMessage) {
+    return latestMessage;
+  }
+  if (latestReasoning) {
+    return `Thinking: ${latestReasoning}`;
+  }
+  return undefined;
+}
+
+function extractProgressText(provider: ProviderRunArgs["provider"], stdout: string, stderr: string): string | undefined {
+  if (provider === "codex") {
+    return parseCodexProgress(stdout);
+  }
+  const output = [stdout, stderr].filter(Boolean).join("\n").trim();
+  if (!output) {
+    return undefined;
+  }
+  return undefined;
 }
 
 function spawnCollectedProcess(
+  provider: ProviderRunArgs["provider"],
   command: string,
   args: string[],
   cwd: string,
@@ -185,6 +240,7 @@ function spawnCollectedProcess(
   signal?: AbortSignal,
   timeoutMs?: number,
   stdinText?: string,
+  onProgress?: (text: string) => void,
 ): ProviderTurnHandle {
   let child: ChildProcess | undefined;
   let killTimer: NodeJS.Timeout | undefined;
@@ -225,6 +281,7 @@ function spawnCollectedProcess(
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let lastProgress = "";
 
     const finish = (code: number) => {
       if (settled) {
@@ -267,9 +324,19 @@ function spawnCollectedProcess(
 
     spawned.stdout?.on("data", (chunk: Buffer | string) => {
       stdout += chunk.toString();
+      const progress = extractProgressText(provider, stdout, stderr);
+      if (progress && progress !== lastProgress) {
+        lastProgress = progress;
+        onProgress?.(progress);
+      }
     });
     spawned.stderr?.on("data", (chunk: Buffer | string) => {
       stderr += chunk.toString();
+      const progress = extractProgressText(provider, stdout, stderr);
+      if (progress && progress !== lastProgress) {
+        lastProgress = progress;
+        onProgress?.(progress);
+      }
     });
     spawned.on("error", (error) => {
       stderr = `${stderr}\n${error.message}`.trim();
@@ -291,7 +358,7 @@ function spawnCollectedProcess(
 
   return {
     cancel,
-    promise: promise.then((result) => normalizeProviderResult(command, args, result)),
+    promise: promise.then((result) => normalizeProviderResult(provider, result)),
   };
 }
 
@@ -416,8 +483,7 @@ function parseGeminiJson(output: string): string {
   }
 }
 
-function normalizeProviderResult(command: string, args: string[], result: ProcessResult): ProviderRunResult {
-  const provider = inferProvider(command, args);
+function normalizeProviderResult(provider: ProviderRunArgs["provider"], result: ProcessResult): ProviderRunResult {
 
   if (result.timedOut) {
     return {
@@ -492,19 +558,6 @@ function panelName(provider: ProviderRunArgs["provider"]): string {
   }
 }
 
-function inferProvider(command: string, args: string[]): ProviderRunArgs["provider"] {
-  if (command === "gemini") {
-    return "gemini";
-  }
-  if (command === "codex") {
-    return "codex";
-  }
-  if (args.some((value) => value.endsWith("package/cli.js"))) {
-    return "claude";
-  }
-  return "claude";
-}
-
 export function startProviderTurn(args: ProviderRunArgs): ProviderTurnHandle {
   const bridgedPrompt = buildProviderPrompt(args);
   const additionalAccessDirs = buildAdditionalAccessDirs(args);
@@ -524,6 +577,7 @@ export function startProviderTurn(args: ProviderRunArgs): ProviderTurnHandle {
       }
     }
     return spawnCollectedProcess(
+      "claude",
       process.execPath,
       cliArgs,
       args.cwd,
@@ -531,6 +585,7 @@ export function startProviderTurn(args: ProviderRunArgs): ProviderTurnHandle {
       args.signal,
       undefined,
       bridgedPrompt,
+      args.onProgress,
     );
   }
 
@@ -539,7 +594,20 @@ export function startProviderTurn(args: ProviderRunArgs): ProviderTurnHandle {
     if (args.planMode) {
       cliArgs.push("--approval-mode", "plan");
     }
-    return spawnCollectedProcess("gemini", cliArgs, args.cwd, sanitizeGeminiEnv(process.env), args.signal, 180000);
+    for (const directory of additionalAccessDirs) {
+      cliArgs.push("--include-directories", directory);
+    }
+    return spawnCollectedProcess(
+      "gemini",
+      "gemini",
+      cliArgs,
+      args.cwd,
+      sanitizeGeminiEnv(process.env),
+      args.signal,
+      180000,
+      undefined,
+      args.onProgress,
+    );
   }
 
   const codexArgs = [
@@ -564,7 +632,17 @@ export function startProviderTurn(args: ProviderRunArgs): ProviderTurnHandle {
     codexArgs.push("--add-dir", directory);
   }
   codexArgs.push("-");
-  return spawnCollectedProcess("codex", codexArgs, args.cwd, process.env, args.signal, undefined, bridgedPrompt);
+  return spawnCollectedProcess(
+    "codex",
+    "codex",
+    codexArgs,
+    args.cwd,
+    process.env,
+    args.signal,
+    undefined,
+    bridgedPrompt,
+    args.onProgress,
+  );
 }
 
 export async function runProviderTurn(args: ProviderRunArgs): Promise<ProviderRunResult> {

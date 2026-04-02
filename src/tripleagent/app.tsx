@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -72,6 +73,8 @@ const WORKTREE_WARNING =
 
 const pastedTextSegmenter = new Intl.Segmenter("ko", { granularity: "grapheme" });
 const PASTED_TEXT_REF_PATTERN_SOURCE = String.raw`\[Pasted Content (\d+) chars #(\d+)\]`;
+const ABSOLUTE_PATH_PATTERN = /\/[^\s"'`<>]+/g;
+const SAVE_SIGNAL_PATTERN = /(save|saved|write|wrote|create|created|저장|작성|생성)/i;
 
 function now(): string {
   return new Date().toLocaleTimeString("ko-KR", { hour12: false });
@@ -230,8 +233,45 @@ function manualLockMessage(provider: ProviderId): string {
   return `${panelTitle(provider)} locked manually. This panel is excluded from normal broadcasts until you run /unlock ${provider}.`;
 }
 
-function buildAccessDirs(rootCwd: string, worktreePath: string | undefined): string[] {
-  const values = [worktreePath, rootCwd, path.dirname(rootCwd)]
+function normalizeAbsolutePathToken(token: string): string | undefined {
+  const normalized = token.replace(/[),.;:!?]+$/g, "").trim();
+  if (!normalized.startsWith("/")) {
+    return undefined;
+  }
+  return path.resolve(normalized);
+}
+
+function extractAbsolutePaths(text: string): string[] {
+  const matches = text.match(ABSOLUTE_PATH_PATTERN) ?? [];
+  return [...new Set(matches.map((value) => normalizeAbsolutePathToken(value)).filter((value): value is string => Boolean(value)))];
+}
+
+function findMissingClaimedOutputPaths(prompt: string, resultText: string): string[] {
+  if (!SAVE_SIGNAL_PATTERN.test(prompt) && !SAVE_SIGNAL_PATTERN.test(resultText)) {
+    return [];
+  }
+  const claimedPaths = extractAbsolutePaths(resultText).filter((value) =>
+    /\.(md|txt|json|yaml|yml|csv|ts|tsx|js|jsx|py|ipynb)$/i.test(value),
+  );
+  return claimedPaths.filter((value) => !existsSync(value));
+}
+
+function summarizeProviderProgress(text: string): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= 140) {
+    return collapsed;
+  }
+  return `${collapsed.slice(0, 137)}...`;
+}
+
+function buildAccessDirs(rootCwd: string, worktreePath: string | undefined, prompt?: string): string[] {
+  const hintedDirs = (prompt ? extractAbsolutePaths(prompt) : []).flatMap((value) => {
+    if (path.extname(value)) {
+      return [path.dirname(value)];
+    }
+    return [value, path.dirname(value)];
+  });
+  const values = [worktreePath, rootCwd, path.dirname(rootCwd), ...hintedDirs]
     .filter((value): value is string => Boolean(value))
     .map((value) => path.resolve(value));
   return [...new Set(values)];
@@ -323,6 +363,7 @@ function buildPanelState(
     status,
     auth,
     entries,
+    activityText: undefined,
     composerText: "",
     worktreePath,
     sessionId: previous?.sessionId ?? randomUUID(),
@@ -493,6 +534,11 @@ function PanelView(props: {
         <Text color={statusColor}> · {statusLabel(props.panel.status)}</Text>
         <Text color="gray"> · {effectivePlanMode(props.globalPlanMode, props.panel) ? "plan" : "normal"}</Text>
       </Text>
+      {props.panel.status === "running" && props.panel.activityText ? (
+        <Box marginTop={1}>
+          <Text color="gray">{props.panel.activityText}</Text>
+        </Box>
+      ) : null}
       <Box flexDirection="column" marginTop={1}>
         {visibleLines.length === 0 ? <Text dimColor>{emptyMessage}</Text> : null}
         {visibleLines.map((line, index) => {
@@ -1016,10 +1062,25 @@ function App({ cwd }: AppProps) {
       provider,
       prompt,
       cwd: options.overrideCwd ?? snapshot.worktreePath ?? cwd,
-      accessDirs: buildAccessDirs(cwd, snapshot.worktreePath),
+      accessDirs: buildAccessDirs(cwd, snapshot.worktreePath, prompt),
       planMode: effectivePlanMode(planModeRef.current, snapshot),
       history: snapshot.entries,
       sessionId: snapshot.sessionId,
+      onProgress: (text) => {
+        setPanels((current) => {
+          const panel = current[provider];
+          if (panel.status !== "running") {
+            return current;
+          }
+          return {
+            ...current,
+            [provider]: {
+              ...panel,
+              activityText: summarizeProviderProgress(text),
+            },
+          };
+        });
+      },
     });
 
     const trackingKey = options.trackingKey ?? provider;
@@ -1029,6 +1090,7 @@ function App({ cwd }: AppProps) {
       [provider]: {
         ...current[provider],
         status: "running",
+        activityText: `${panelTitle(provider)} is working...`,
         lastError: undefined,
         entries: [...current[provider].entries, makeEntry("user", prompt, options.displayPrompt ?? prompt)],
       },
@@ -1036,6 +1098,11 @@ function App({ cwd }: AppProps) {
     const result = await handle.promise;
     activeTurnsRef.current.delete(trackingKey);
     const refreshedAuth = result.lockReason === "auth" ? getAuthStatuses()[provider] : undefined;
+    const missingClaimedOutputPaths = result.ok ? findMissingClaimedOutputPaths(prompt, result.text) : [];
+    const verificationWarning =
+      missingClaimedOutputPaths.length > 0
+        ? `The model claimed to save ${missingClaimedOutputPaths.join(", ")} but the file was not found on disk.`
+        : undefined;
     const effectiveLockReason =
       result.lockReason === "auth" && refreshedAuth?.state === "ready" ? undefined : result.lockReason;
     const effectiveLockMessage =
@@ -1068,8 +1135,20 @@ function App({ cwd }: AppProps) {
         [provider]: {
           ...panel,
           auth,
-          status: manuallyLocked ? "locked" : effectiveLockReason ? "locked" : result.interrupted ? "idle" : result.ok ? "idle" : "error",
-          lastError: result.ok || result.interrupted ? undefined : result.rawOutput,
+          status:
+            manuallyLocked
+              ? "locked"
+              : effectiveLockReason
+                ? "locked"
+                : verificationWarning
+                  ? "error"
+                  : result.interrupted
+                    ? "idle"
+                    : result.ok
+                      ? "idle"
+                      : "error",
+          activityText: undefined,
+          lastError: verificationWarning ?? (result.ok || result.interrupted ? undefined : result.rawOutput),
           lockReason: manuallyLocked ? "manual" : effectiveLockReason,
           lockMessage: manuallyLocked ? panel.lockMessage ?? manualLockMessage(provider) : effectiveLockMessage,
           latestBundle: current[provider].latestBundle,
@@ -1079,12 +1158,13 @@ function App({ cwd }: AppProps) {
               result.ok && !effectiveLockReason && !manuallyLocked ? "assistant" : "system",
               manuallyLocked ? panel.lockMessage ?? manualLockMessage(provider) : effectiveLockReason ? effectiveLockMessage ?? result.text : result.text,
             ),
+            ...(verificationWarning ? [makeEntry("system", verificationWarning)] : []),
           ],
         },
       };
     });
 
-    if (result.ok && options.persistBundle !== false) {
+    if (result.ok && !verificationWarning && options.persistBundle !== false) {
       const bundle = captureResultBundle(worktreeSetup, provider, result.text);
       if (bundle) {
         setPanels((current) => ({
@@ -1151,10 +1231,25 @@ function App({ cwd }: AppProps) {
       provider: "codex",
       prompt: fusionPrompt,
       cwd: fusionWorktree.path,
-      accessDirs: buildAccessDirs(cwd, fusionWorktree.path),
+      accessDirs: buildAccessDirs(cwd, fusionWorktree.path, fusionPrompt),
       planMode: effectivePlanMode(planModeRef.current, codexPanel),
       history: codexPanel.entries,
       sessionId: codexPanel.sessionId,
+      onProgress: (text) => {
+        setPanels((current) => {
+          const panel = current.codex;
+          if (panel.status !== "running") {
+            return current;
+          }
+          return {
+            ...current,
+            codex: {
+              ...panel,
+              activityText: summarizeProviderProgress(text),
+            },
+          };
+        });
+      },
     });
 
     activeTurnsRef.current.set("fusion", handle);
@@ -1163,6 +1258,7 @@ function App({ cwd }: AppProps) {
       codex: {
         ...current.codex,
         status: "running",
+        activityText: "Synthesizing candidate diffs...",
         lastError: undefined,
         entries: [...current.codex.entries, makeEntry("user", "/fuse")],
       },
@@ -1198,6 +1294,7 @@ function App({ cwd }: AppProps) {
                 : result.ok
                   ? "idle"
                   : "error",
+        activityText: undefined,
         lastError: result.ok || result.interrupted ? undefined : result.rawOutput,
         lockReason: current.codex.lockReason === "manual" ? "manual" : effectiveLockReason,
         lockMessage:

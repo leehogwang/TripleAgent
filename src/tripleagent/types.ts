@@ -28,6 +28,7 @@ export type PanelState = {
   status: PanelStatus;
   auth: ProviderAuth;
   entries: TranscriptEntry[];
+  activityText: string | undefined;
   composerText: string;
   worktreePath: string | undefined;
   sessionId: string;
@@ -85,6 +86,7 @@ export type ProviderRunArgs = {
   accessDirs: string[];
   planMode: boolean;
   history: TranscriptEntry[];
+  onProgress?: (text: string) => void;
   signal?: AbortSignal;
   sessionId?: string;
 };
