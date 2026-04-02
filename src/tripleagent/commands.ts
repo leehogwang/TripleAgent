@@ -2,7 +2,21 @@ import { readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const APP_SUPPORTED = new Set(["clear", "exit", "fuse", "help", "init", "login", "logout", "pick", "plan", "resume", "status"]);
+const APP_SUPPORTED = new Set([
+  "clear",
+  "exit",
+  "fuse",
+  "help",
+  "init",
+  "lock",
+  "login",
+  "logout",
+  "pick",
+  "plan",
+  "resume",
+  "status",
+  "unlock",
+]);
 
 export type CommandParse =
   | { kind: "app"; name: string; args: string[] }
@@ -27,6 +41,39 @@ export function getKnownCommands(): string[] {
     names.add(name);
   }
   return [...names].sort();
+}
+
+export function getSlashCommandSuggestions(input: string, limit = 6): string[] {
+  const trimmed = input.trimStart();
+  if (!trimmed.startsWith("/")) {
+    return [];
+  }
+
+  const token = trimmed.slice(1);
+  if (!token || /\s/.test(token)) {
+    return [];
+  }
+
+  const query = token.toLowerCase();
+  const known = getKnownCommands();
+  const ranked = known
+    .map((name) => {
+      const lower = name.toLowerCase();
+      if (lower === query) {
+        return { name, score: 0 };
+      }
+      if (lower.startsWith(query)) {
+        return { name, score: 1 };
+      }
+      if (lower.includes(query)) {
+        return { name, score: 2 };
+      }
+      return null;
+    })
+    .filter((item): item is { name: string; score: number } => item !== null)
+    .sort((left, right) => left.score - right.score || left.name.localeCompare(right.name));
+
+  return ranked.slice(0, limit).map((item) => item.name);
 }
 
 export function parseSlashCommand(input: string): CommandParse | null {
@@ -60,8 +107,9 @@ export function buildHelpText(): string {
     "TripleAgent commands",
     `Supported in-app: ${supported.map((name) => `/${name}`).join(", ")}`,
     `Claude command registry: ${claudeOnly.map((name) => `/${name}`).join(", ")}`,
-    "Shared composer: /help /status /plan /init /clear /resume /pick /fuse /login /logout /exit",
+    "Shared composer: /help /status /plan /init /lock /unlock /clear /resume /pick /fuse /login /logout /exit",
     "Panel composers: provider-local prompts plus the Claude registry on the Claude panel.",
-    "Use Tab or Shift+Tab to move focus, and press Esc twice quickly to stop all running agents.",
+    "Use Tab to accept slash autocomplete when visible, otherwise move focus. Shift+Tab moves focus backward.",
+    "Press Esc twice quickly to stop all running agents.",
   ].join("\n");
 }

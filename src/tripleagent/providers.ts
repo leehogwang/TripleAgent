@@ -26,6 +26,7 @@ const GEMINI_NOISE_PATTERNS = [
 ];
 
 const GEMINI_MODEL = "gemini-2.5-flash";
+const CODEX_MODEL = "gpt-5.4";
 
 const AUTH_FAILURE_PATTERNS = [
   /not logged in/i,
@@ -88,26 +89,92 @@ function resolveClaudeCliPath(): string {
   return path.resolve(currentDir, "../../Leonxlnx-claude-code/package/cli.js");
 }
 
-function buildPrompt(args: ProviderRunArgs): string {
-  const recent = args.history
+function clipText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) {
+    return text;
+  }
+  return `${text.slice(0, maxChars)}\n...[truncated ${text.length - maxChars} chars]`;
+}
+
+function formatRecentHistory(args: ProviderRunArgs, maxEntries: number, maxCharsPerEntry: number): string {
+  return args.history
     .filter((entry) => entry.role !== "system")
-    .slice(-8)
-    .map((entry) => `${entry.role.toUpperCase()}: ${entry.text}`)
+    .slice(-maxEntries)
+    .map((entry) => `${entry.role.toUpperCase()}: ${clipText(entry.text, maxCharsPerEntry)}`)
     .join("\n");
+}
 
-  const header = [
-    `You are the ${args.provider} panel inside TripleAgent.`,
-    "Work independently from the other panels.",
-    args.planMode
-      ? "PLAN MODE is active. Analyze, plan, and explain. Do not claim to have edited files unless you actually changed them."
-      : "IMPLEMENTATION MODE is active. You may inspect and modify files in the assigned worktree when appropriate.",
-  ].join("\n");
+function buildProviderPrompt(args: ProviderRunArgs): string {
+  const accessHint = args.accessDirs.length
+    ? `Accessible absolute paths: ${args.accessDirs.join(", ")}`
+    : "Accessible absolute paths: current working directory only";
 
+  if (args.provider === "claude") {
+    const recent = formatRecentHistory(args, 6, 1400);
+    const header = [
+      "You are the Claude panel inside TripleAgent.",
+      "Answer directly and do not mention TripleAgent internals unless the user asks.",
+      args.planMode
+        ? "PLAN MODE is active. Analyze, plan, and explain. Do not claim to have edited files unless you actually changed them."
+        : "IMPLEMENTATION MODE is active. You may inspect and modify files in the assigned worktree when appropriate.",
+      accessHint,
+    ].join("\n");
+
+    return [
+      header,
+      recent ? `Recent panel history:\n${recent}` : "Recent panel history: none",
+      `Latest user request:\n${args.prompt}`,
+    ].join("\n\n");
+  }
+
+  if (args.provider === "codex") {
+    const recent = formatRecentHistory(args, 3, 800);
+    return [
+      "You are the Codex panel inside TripleAgent.",
+      "Use Codex-native behavior and respond concisely.",
+      args.planMode
+        ? "PLAN MODE is active. Analyze first, propose concrete fixes, and avoid claiming file edits unless you actually changed files."
+        : "IMPLEMENTATION MODE is active. You may inspect and modify files in the working tree when needed.",
+      accessHint,
+      recent ? `Recent conversation summary:\n${recent}` : undefined,
+      `Current request:\n${clipText(args.prompt, 12000)}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+  }
+
+  const recent = formatRecentHistory(args, 2, 700);
   return [
-    header,
-    recent ? `Recent panel history:\n${recent}` : "Recent panel history: none",
-    `Latest user request:\n${args.prompt}`,
-  ].join("\n\n");
+    "You are the Gemini panel inside TripleAgent.",
+    "Respond directly, stay concise, and focus on the latest request.",
+    args.planMode
+      ? "PLAN MODE is active. Analyze and explain before proposing execution."
+      : "IMPLEMENTATION MODE is active. You may inspect files in the working tree when needed.",
+    accessHint,
+    recent ? `Recent conversation summary:\n${recent}` : undefined,
+    `Current request:\n${clipText(args.prompt, 10000)}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function sanitizeClaudeEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...source };
+  delete env.CLAUDE_CODE_ENTRYPOINT_CWD;
+  delete env.CLAUDE_CODE_CWD;
+  delete env.NODE_OPTIONS;
+  delete env.PWD;
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("TSX_") || key.startsWith("ESBK_")) {
+      delete env[key];
+    }
+  }
+  return env;
+}
+
+function buildAdditionalAccessDirs(args: ProviderRunArgs): string[] {
+  const current = path.resolve(args.cwd);
+  return [...new Set(args.accessDirs.map((value) => path.resolve(value)).filter((value) => value !== current))];
 }
 
 function spawnCollectedProcess(
@@ -117,6 +184,7 @@ function spawnCollectedProcess(
   env: NodeJS.ProcessEnv,
   signal?: AbortSignal,
   timeoutMs?: number,
+  stdinText?: string,
 ): ProviderTurnHandle {
   let child: ChildProcess | undefined;
   let killTimer: NodeJS.Timeout | undefined;
@@ -181,9 +249,13 @@ function spawnCollectedProcess(
     const spawned = spawn(command, args, {
       cwd,
       env,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [stdinText === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
     child = spawned;
+    spawned.stdin?.on("error", () => {
+      // A fast exit can close stdin before the prompt is fully written.
+      // The caller only cares about process completion, not write acknowledgements.
+    });
 
     const handleAbort = () => cancel();
     signal?.addEventListener("abort", handleAbort, { once: true });
@@ -207,6 +279,10 @@ function spawnCollectedProcess(
       signal?.removeEventListener("abort", handleAbort);
       finish(code ?? 1);
     });
+
+    if (stdinText !== undefined) {
+      spawned.stdin?.end(stdinText);
+    }
 
     if (signal?.aborted) {
       cancel();
@@ -430,7 +506,8 @@ function inferProvider(command: string, args: string[]): ProviderRunArgs["provid
 }
 
 export function startProviderTurn(args: ProviderRunArgs): ProviderTurnHandle {
-  const bridgedPrompt = buildPrompt(args);
+  const bridgedPrompt = buildProviderPrompt(args);
+  const additionalAccessDirs = buildAdditionalAccessDirs(args);
 
   if (args.provider === "claude") {
     const cliArgs = [
@@ -441,8 +518,20 @@ export function startProviderTurn(args: ProviderRunArgs): ProviderTurnHandle {
       "--permission-mode",
       args.planMode ? "plan" : "acceptEdits",
     ];
-    cliArgs.push(bridgedPrompt);
-    return spawnCollectedProcess(process.execPath, cliArgs, args.cwd, process.env, args.signal);
+    if (additionalAccessDirs.length > 0) {
+      for (const directory of additionalAccessDirs) {
+        cliArgs.push("--add-dir", directory);
+      }
+    }
+    return spawnCollectedProcess(
+      process.execPath,
+      cliArgs,
+      args.cwd,
+      sanitizeClaudeEnv(process.env),
+      args.signal,
+      undefined,
+      bridgedPrompt,
+    );
   }
 
   if (args.provider === "gemini") {
@@ -450,7 +539,7 @@ export function startProviderTurn(args: ProviderRunArgs): ProviderTurnHandle {
     if (args.planMode) {
       cliArgs.push("--approval-mode", "plan");
     }
-    return spawnCollectedProcess("gemini", cliArgs, args.cwd, sanitizeGeminiEnv(process.env), args.signal, 60000);
+    return spawnCollectedProcess("gemini", cliArgs, args.cwd, sanitizeGeminiEnv(process.env), args.signal, 180000);
   }
 
   const codexArgs = [
@@ -460,11 +549,22 @@ export function startProviderTurn(args: ProviderRunArgs): ProviderTurnHandle {
     "--json",
     "--skip-git-repo-check",
     "--dangerously-bypass-approvals-and-sandbox",
+    "-m",
+    CODEX_MODEL,
+    "-c",
+    "model_reasoning_effort=xhigh",
+    "-c",
+    "plan_mode_reasoning_effort=xhigh",
+    "-c",
+    "service_tier=fast",
     "--cd",
     args.cwd,
-    bridgedPrompt,
   ];
-  return spawnCollectedProcess("codex", codexArgs, args.cwd, process.env, args.signal);
+  for (const directory of additionalAccessDirs) {
+    codexArgs.push("--add-dir", directory);
+  }
+  codexArgs.push("-");
+  return spawnCollectedProcess("codex", codexArgs, args.cwd, process.env, args.signal, undefined, bridgedPrompt);
 }
 
 export async function runProviderTurn(args: ProviderRunArgs): Promise<ProviderRunResult> {

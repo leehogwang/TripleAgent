@@ -4,7 +4,7 @@ export type ComposerTarget = ProviderId | "shared";
 export type AuthState = "ready" | "auth_required" | "unsupported";
 
 export type PanelStatus = "idle" | "running" | "locked" | "error";
-export type PanelLockReason = "auth" | "quota" | "workspace";
+export type PanelLockReason = "auth" | "quota" | "workspace" | "manual";
 
 export type TranscriptRole = "system" | "user" | "assistant";
 
@@ -82,6 +82,7 @@ export type ProviderRunArgs = {
   provider: ProviderId;
   prompt: string;
   cwd: string;
+  accessDirs: string[];
   planMode: boolean;
   history: TranscriptEntry[];
   signal?: AbortSignal;

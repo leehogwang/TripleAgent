@@ -1,3 +1,4 @@
+import path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -6,7 +7,7 @@ import stringWidth from "string-width";
 import wrapAnsi from "wrap-ansi";
 
 import { getAuthStatuses } from "./auth.js";
-import { buildHelpText, parseSlashCommand } from "./commands.js";
+import { buildHelpText, getSlashCommandSuggestions, parseSlashCommand } from "./commands.js";
 import { HarnessTextInput } from "./HarnessTextInput.js";
 import { loadPersistedSession, savePersistedSession } from "./persistence.js";
 import { startProviderTurn, type ProviderTurnHandle } from "./providers.js";
@@ -51,6 +52,11 @@ type TranscriptLine = {
   text: string;
 };
 
+type ComposerAutocomplete = {
+  target: ComposerTarget;
+  suggestions: string[];
+};
+
 const PROVIDERS: ProviderId[] = ["codex", "claude", "gemini"];
 const COMPOSER_ORDER: ComposerTarget[] = ["codex", "claude", "gemini", "shared"];
 const PASTE_COLLAPSE_THRESHOLD = 800;
@@ -58,6 +64,8 @@ const PASTE_COLLAPSE_MAX_LINES = 2;
 
 const AUTH_LOCK_MESSAGE =
   "Authentication required. This panel is dimmed and excluded from normal broadcasts until login succeeds.";
+const MANUAL_LOCK_MESSAGE =
+  "Locked manually. This panel is dimmed and excluded from normal broadcasts until you run /unlock.";
 
 const WORKTREE_WARNING =
   "Git worktrees are unavailable in this directory. TripleAgent can still answer prompts, but /pick and /fuse are disabled.";
@@ -218,6 +226,17 @@ function quotaLockMessage(provider: ProviderId): string {
   }
 }
 
+function manualLockMessage(provider: ProviderId): string {
+  return `${panelTitle(provider)} locked manually. This panel is excluded from normal broadcasts until you run /unlock ${provider}.`;
+}
+
+function buildAccessDirs(rootCwd: string, worktreePath: string | undefined): string[] {
+  const values = [worktreePath, rootCwd, path.dirname(rootCwd)]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => path.resolve(value));
+  return [...new Set(values)];
+}
+
 function providerAccentColor(provider: ProviderId): string {
   switch (provider) {
     case "codex":
@@ -261,6 +280,13 @@ function panelCanReceivePrompts(panel: PanelState): boolean {
   return panel.auth.state === "ready" && panel.status !== "locked" && panel.status !== "running";
 }
 
+function parseProviderArg(value: string | undefined): ProviderId | undefined {
+  if (value === "codex" || value === "claude" || value === "gemini") {
+    return value;
+  }
+  return undefined;
+}
+
 function effectivePlanMode(globalPlanMode: boolean, panel: PanelState): boolean {
   return panel.planModeOverride ?? globalPlanMode;
 }
@@ -283,9 +309,9 @@ function buildPanelState(
     if (entries.length === 0) {
       entries.push(makeEntry("system", AUTH_LOCK_MESSAGE));
     }
-  } else if (lockReason === "quota") {
+  } else if (lockReason === "quota" || lockReason === "manual") {
     status = "locked";
-    lockMessage = lockMessage ?? quotaLockMessage(provider);
+    lockMessage = lockMessage ?? (lockReason === "manual" ? manualLockMessage(provider) : quotaLockMessage(provider));
     if (entries.length === 0) {
       entries.push(makeEntry("system", lockMessage));
     }
@@ -341,10 +367,12 @@ function ComposerView(props: {
   locked: boolean;
   value: string;
   placeholder: string;
+  suggestions: string[] | undefined;
   onChange: (value: string) => void;
   onSubmit: (value: string) => void;
 }) {
   const prefixColor = props.locked ? "gray" : props.active ? "white" : "gray";
+  const suggestions = props.suggestions ?? [];
   const content =
     props.active && !props.locked ? (
       <HarnessTextInput
@@ -361,16 +389,31 @@ function ComposerView(props: {
     );
 
   return (
-    <Box backgroundColor="#202020" paddingX={1} flexDirection="row">
-      <Box marginRight={1} flexShrink={0}>
-        <Text color={prefixColor}>
-          {props.label}
-          {">"}
-        </Text>
+    <Box flexDirection="column">
+      <Box backgroundColor="#202020" paddingX={1} flexDirection="row">
+        <Box marginRight={1} flexShrink={0}>
+          <Text color={prefixColor}>
+            {props.label}
+            {">"}
+          </Text>
+        </Box>
+        <Box flexGrow={1} flexShrink={1}>
+          {content}
+        </Box>
       </Box>
-      <Box flexGrow={1} flexShrink={1}>
-        {content}
-      </Box>
+      {props.active && suggestions.length > 0 ? (
+        <Box paddingLeft={1} marginTop={0}>
+          <Text color="gray">
+            Tab autocomplete:{" "}
+            {suggestions.map((suggestion, index) => (
+              <React.Fragment key={`${props.label}-suggestion-${suggestion}`}>
+                <Text color={index === 0 ? "white" : "gray"}>{`/${suggestion}`}</Text>
+                {index < suggestions.length - 1 ? <Text color="gray"> · </Text> : null}
+              </React.Fragment>
+            ))}
+          </Text>
+        </Box>
+      ) : null}
     </Box>
   );
 }
@@ -422,6 +465,7 @@ function PanelView(props: {
   contentWidth: number;
   globalPlanMode: boolean;
   composerActive: boolean;
+  composerSuggestions?: string[];
   onComposerChange: (value: string) => void;
   onComposerSubmit: (value: string) => void;
 }) {
@@ -480,6 +524,7 @@ function PanelView(props: {
           locked={locked}
           value={props.panel.composerText}
           placeholder={locked ? "panel disabled" : "panel-local prompt or slash command"}
+          suggestions={props.composerSuggestions}
           onChange={props.onComposerChange}
           onSubmit={props.onComposerSubmit}
         />
@@ -527,6 +572,7 @@ function App({ cwd }: AppProps) {
   const escapeArmedAtRef = useRef<number | undefined>(undefined);
   const noticeTimerRef = useRef<NodeJS.Timeout | undefined>(undefined);
   const panelContentWidthRef = useRef(26);
+  const persistenceArmedRef = useRef(false);
 
   useEffect(() => {
     panelsRef.current = panels;
@@ -612,6 +658,10 @@ function App({ cwd }: AppProps) {
   }, [panelContentWidth]);
 
   useEffect(() => {
+    if (!persistenceArmedRef.current) {
+      persistenceArmedRef.current = true;
+      return;
+    }
     const payload: PersistedSession = {
       cwd,
       planMode,
@@ -644,6 +694,28 @@ function App({ cwd }: AppProps) {
     };
     savePersistedSession(payload);
   }, [cwd, panels, planMode]);
+
+  const composerAutocomplete = useMemo<Record<ComposerTarget, ComposerAutocomplete>>(
+    () => ({
+      shared: {
+        target: "shared",
+        suggestions: getSlashCommandSuggestions(sharedInput),
+      },
+      codex: {
+        target: "codex",
+        suggestions: getSlashCommandSuggestions(panels.codex.composerText),
+      },
+      claude: {
+        target: "claude",
+        suggestions: getSlashCommandSuggestions(panels.claude.composerText),
+      },
+      gemini: {
+        target: "gemini",
+        suggestions: getSlashCommandSuggestions(panels.gemini.composerText),
+      },
+    }),
+    [panels.claude.composerText, panels.codex.composerText, panels.gemini.composerText, sharedInput],
+  );
 
   function showNotice(message: string): void {
     setNotice(message);
@@ -678,6 +750,46 @@ function App({ cwd }: AppProps) {
       }
       return next;
     });
+  }
+
+  function cancelActiveTurnsForProvider(provider: ProviderId): void {
+    for (const [key, handle] of activeTurnsRef.current.entries()) {
+      if (key === provider || (provider === "codex" && key === "fusion")) {
+        handle.cancel();
+      }
+    }
+  }
+
+  function setManualLock(provider: ProviderId): void {
+    cancelActiveTurnsForProvider(provider);
+    setPanels((current) => ({
+      ...current,
+      [provider]: {
+        ...current[provider],
+        status: "locked",
+        lockReason: "manual",
+        lockMessage: manualLockMessage(provider),
+        entries: [...current[provider].entries, makeEntry("system", manualLockMessage(provider))],
+      },
+    }));
+  }
+
+  function clearManualLock(provider: ProviderId): void {
+    const auth = getAuthStatuses()[provider];
+    setPanels((current) => ({
+      ...current,
+      [provider]: {
+        ...current[provider],
+        auth,
+        status: auth.state === "ready" ? "idle" : "locked",
+        lockReason: auth.state === "ready" ? undefined : "auth",
+        lockMessage: auth.state === "ready" ? undefined : AUTH_LOCK_MESSAGE,
+        entries: [
+          ...current[provider].entries,
+          makeEntry("system", auth.state === "ready" ? `${panelTitle(provider)} unlocked.` : AUTH_LOCK_MESSAGE),
+        ],
+      },
+    }));
   }
 
   function clearPanels(scope: ComposerTarget): void {
@@ -715,12 +827,28 @@ function App({ cwd }: AppProps) {
         const auth = auths[provider];
         const authLocked = auth.state !== "ready";
         const currentPanel = current[provider];
+        const preservedLockReason =
+          !authLocked && (currentPanel.lockReason === "manual" || currentPanel.lockReason === "quota")
+            ? currentPanel.lockReason
+            : undefined;
+        const preservedLockMessage =
+          preservedLockReason === "manual"
+            ? currentPanel.lockMessage ?? manualLockMessage(provider)
+            : preservedLockReason === "quota"
+              ? currentPanel.lockMessage ?? quotaLockMessage(provider)
+              : undefined;
         next[provider] = {
           ...currentPanel,
           auth,
-          status: authLocked ? "locked" : currentPanel.status === "running" ? "running" : "idle",
-          lockReason: authLocked ? "auth" : undefined,
-          lockMessage: authLocked ? AUTH_LOCK_MESSAGE : undefined,
+          status: authLocked
+            ? "locked"
+            : preservedLockReason
+              ? "locked"
+              : currentPanel.status === "running"
+                ? "running"
+                : "idle",
+          lockReason: authLocked ? "auth" : preservedLockReason,
+          lockMessage: authLocked ? AUTH_LOCK_MESSAGE : preservedLockMessage,
           entries: noticeMessage
             ? [...currentPanel.entries, makeEntry("system", authLocked ? `${noticeMessage} Authentication required.` : `${noticeMessage} Ready.`)]
             : currentPanel.entries,
@@ -740,8 +868,32 @@ function App({ cwd }: AppProps) {
     showNotice("Stopping all running agents...");
   }
 
+  function applySlashAutocomplete(target: ComposerTarget): boolean {
+    const currentValue = composerValueRef.current[target];
+    const suggestions = composerAutocomplete[target].suggestions;
+    const selected = suggestions[0];
+    if (!currentValue.trimStart().startsWith("/") || !selected) {
+      return false;
+    }
+
+    const leadingWhitespace = currentValue.match(/^\s*/)?.[0] ?? "";
+    const remainder = currentValue.slice(leadingWhitespace.length);
+    const slashMatch = remainder.match(/^\/([^\s]*)/);
+    if (!slashMatch) {
+      return false;
+    }
+
+    const completed = `${leadingWhitespace}/${selected} `;
+    const trailing = remainder.slice(slashMatch[0].length);
+    setComposerDisplayValue(target, `${completed}${trailing.replace(/^\s*/, "")}`);
+    return true;
+  }
+
   useInput((value, key) => {
     if (key.tab) {
+      if (!key.shift && applySlashAutocomplete(activeComposer)) {
+        return;
+      }
       setActiveComposer((current) => nextComposerTarget(current, panelsRef.current, key.shift ? -1 : 1));
       return;
     }
@@ -864,6 +1016,7 @@ function App({ cwd }: AppProps) {
       provider,
       prompt,
       cwd: options.overrideCwd ?? snapshot.worktreePath ?? cwd,
+      accessDirs: buildAccessDirs(cwd, snapshot.worktreePath),
       planMode: effectivePlanMode(planModeRef.current, snapshot),
       history: snapshot.entries,
       sessionId: snapshot.sessionId,
@@ -882,40 +1035,50 @@ function App({ cwd }: AppProps) {
     }));
     const result = await handle.promise;
     activeTurnsRef.current.delete(trackingKey);
+    const refreshedAuth = result.lockReason === "auth" ? getAuthStatuses()[provider] : undefined;
+    const effectiveLockReason =
+      result.lockReason === "auth" && refreshedAuth?.state === "ready" ? undefined : result.lockReason;
+    const effectiveLockMessage =
+      effectiveLockReason === result.lockReason
+        ? result.lockMessage ??
+          (effectiveLockReason === "quota"
+            ? quotaLockMessage(provider)
+            : effectiveLockReason === "auth"
+              ? AUTH_LOCK_MESSAGE
+              : undefined)
+        : undefined;
 
     setPanels((current) => {
       const panel = current[provider];
+      const manuallyLocked = panel.lockReason === "manual";
       const auth =
-        result.lockReason === "auth"
+        manuallyLocked
+          ? panel.auth
+          : effectiveLockReason === "auth"
           ? {
               ...panel.auth,
               state: "auth_required" as const,
               summary: `${panel.title} authentication lost`,
               detail: `Run: tripleagent auth login ${provider}`,
             }
-          : panel.auth;
-      const lockReason = result.lockReason;
-      const lockMessage =
-        result.lockMessage ??
-        (lockReason === "quota"
-          ? quotaLockMessage(provider)
-          : lockReason === "auth"
-            ? AUTH_LOCK_MESSAGE
-            : undefined);
+          : refreshedAuth ?? panel.auth;
 
       return {
         ...current,
         [provider]: {
           ...panel,
           auth,
-          status: lockReason ? "locked" : result.interrupted ? "idle" : result.ok ? "idle" : "error",
+          status: manuallyLocked ? "locked" : effectiveLockReason ? "locked" : result.interrupted ? "idle" : result.ok ? "idle" : "error",
           lastError: result.ok || result.interrupted ? undefined : result.rawOutput,
-          lockReason,
-          lockMessage,
+          lockReason: manuallyLocked ? "manual" : effectiveLockReason,
+          lockMessage: manuallyLocked ? panel.lockMessage ?? manualLockMessage(provider) : effectiveLockMessage,
           latestBundle: current[provider].latestBundle,
           entries: [
             ...panel.entries,
-            makeEntry(result.ok && !lockReason ? "assistant" : "system", lockReason ? lockMessage ?? result.text : result.text),
+            makeEntry(
+              result.ok && !effectiveLockReason && !manuallyLocked ? "assistant" : "system",
+              manuallyLocked ? panel.lockMessage ?? manualLockMessage(provider) : effectiveLockReason ? effectiveLockMessage ?? result.text : result.text,
+            ),
           ],
         },
       };
@@ -988,6 +1151,7 @@ function App({ cwd }: AppProps) {
       provider: "codex",
       prompt: fusionPrompt,
       cwd: fusionWorktree.path,
+      accessDirs: buildAccessDirs(cwd, fusionWorktree.path),
       planMode: effectivePlanMode(planModeRef.current, codexPanel),
       history: codexPanel.entries,
       sessionId: codexPanel.sessionId,
@@ -1006,18 +1170,48 @@ function App({ cwd }: AppProps) {
 
     const result = await handle.promise;
     activeTurnsRef.current.delete("fusion");
+    const refreshedAuth = result.lockReason === "auth" ? getAuthStatuses().codex : undefined;
+    const effectiveLockReason =
+      result.lockReason === "auth" && refreshedAuth?.state === "ready" ? undefined : result.lockReason;
+    const effectiveLockMessage =
+      effectiveLockReason === result.lockReason
+        ? result.lockMessage ??
+          (effectiveLockReason === "quota"
+            ? quotaLockMessage("codex")
+            : effectiveLockReason === "auth"
+              ? AUTH_LOCK_MESSAGE
+              : undefined)
+        : undefined;
 
     setPanels((current) => ({
       ...current,
       codex: {
         ...current.codex,
-        status: result.lockReason ? "locked" : result.interrupted ? "idle" : result.ok ? "idle" : "error",
+        auth: current.codex.lockReason === "manual" ? current.codex.auth : effectiveLockReason === "auth" ? current.codex.auth : refreshedAuth ?? current.codex.auth,
+        status:
+          current.codex.lockReason === "manual"
+            ? "locked"
+            : effectiveLockReason
+              ? "locked"
+              : result.interrupted
+                ? "idle"
+                : result.ok
+                  ? "idle"
+                  : "error",
         lastError: result.ok || result.interrupted ? undefined : result.rawOutput,
-        lockReason: result.lockReason,
-        lockMessage: result.lockMessage,
+        lockReason: current.codex.lockReason === "manual" ? "manual" : effectiveLockReason,
+        lockMessage:
+          current.codex.lockReason === "manual"
+            ? current.codex.lockMessage ?? manualLockMessage("codex")
+            : effectiveLockMessage,
         entries: [
           ...current.codex.entries,
-          makeEntry(result.ok && !result.lockReason ? "assistant" : "system", result.lockMessage ?? result.text),
+          makeEntry(
+            result.ok && !effectiveLockReason && current.codex.lockReason !== "manual" ? "assistant" : "system",
+            current.codex.lockReason === "manual"
+              ? current.codex.lockMessage ?? manualLockMessage("codex")
+              : effectiveLockMessage ?? result.text,
+          ),
         ],
       },
     }));
@@ -1089,15 +1283,40 @@ function App({ cwd }: AppProps) {
           target === "shared" ? appendSystemAll("No saved TripleAgent session found.") : appendSystem(target, "No saved TripleAgent session found.");
           return;
         }
+        for (const handle of activeTurnsRef.current.values()) {
+          handle.cancel();
+        }
+        activeTurnsRef.current.clear();
         setPastedTextRefs({});
         const auths = getAuthStatuses();
+        const restoredCodex = buildPanelState("codex", auths.codex, worktreeSetup.panelWorktrees.codex, session.panels.codex);
+        const restoredClaude = buildPanelState("claude", auths.claude, worktreeSetup.panelWorktrees.claude, session.panels.claude);
+        const restoredGemini = buildPanelState("gemini", auths.gemini, worktreeSetup.panelWorktrees.gemini, session.panels.gemini);
+        const resumeMessage = `Restored saved session from ${session.cwd}.`;
         setPlanMode(session.planMode);
         setPanels({
-          codex: buildPanelState("codex", auths.codex, worktreeSetup.panelWorktrees.codex, session.panels.codex),
-          claude: buildPanelState("claude", auths.claude, worktreeSetup.panelWorktrees.claude, session.panels.claude),
-          gemini: buildPanelState("gemini", auths.gemini, worktreeSetup.panelWorktrees.gemini, session.panels.gemini),
+          codex: {
+            ...restoredCodex,
+            entries: [
+              ...restoredCodex.entries,
+              makeEntry("system", resumeMessage),
+            ],
+          },
+          claude: {
+            ...restoredClaude,
+            entries: [
+              ...restoredClaude.entries,
+              makeEntry("system", resumeMessage),
+            ],
+          },
+          gemini: {
+            ...restoredGemini,
+            entries: [
+              ...restoredGemini.entries,
+              makeEntry("system", resumeMessage),
+            ],
+          },
         });
-        appendSystemAll("Restored saved session.");
         return;
       }
       case "init":
@@ -1114,6 +1333,39 @@ function App({ cwd }: AppProps) {
         const provider = args[0] ?? (target === "shared" ? "all" : target);
         const message = `Run outside the UI: tripleagent auth ${name} ${provider}`;
         target === "shared" ? appendSystemAll(message) : appendSystem(target, message);
+        return;
+      }
+      case "lock": {
+        if (target === "shared") {
+          const provider = parseProviderArg(args[0]);
+          if (!provider) {
+            appendSystemAll("Usage: /lock <codex|claude|gemini>");
+            return;
+          }
+          setManualLock(provider);
+          return;
+        }
+        setManualLock(target);
+        return;
+      }
+      case "unlock": {
+        if (target === "shared") {
+          const providerArg = args[0] ?? "all";
+          if (providerArg === "all") {
+            for (const provider of PROVIDERS) {
+              clearManualLock(provider);
+            }
+            return;
+          }
+          const provider = parseProviderArg(providerArg);
+          if (!provider) {
+            appendSystemAll("Usage: /unlock <codex|claude|gemini|all>");
+            return;
+          }
+          clearManualLock(provider);
+          return;
+        }
+        clearManualLock(target);
         return;
       }
       case "pick": {
@@ -1240,6 +1492,7 @@ function App({ cwd }: AppProps) {
               contentWidth={panelContentWidth}
               globalPlanMode={planMode}
               composerActive={activeComposer === provider}
+              composerSuggestions={composerAutocomplete[provider].suggestions}
               onComposerChange={(value) => handleComposerChange(provider, value)}
               onComposerSubmit={(value) => submitPanel(provider, value)}
             />
@@ -1265,11 +1518,12 @@ function App({ cwd }: AppProps) {
           locked={false}
           value={sharedInput}
           placeholder="broadcast prompt or global command"
+          suggestions={composerAutocomplete.shared.suggestions}
           onChange={(value) => handleComposerChange("shared", value)}
           onSubmit={submitShared}
         />
       </Box>
-      <Text color="gray">Tab focus · Panels stack upward from the bottom · Shared: /help /status /plan /init /clear /resume /pick /fuse · Esc Esc stops all</Text>
+      <Text color="gray">Tab autocomplete/focus · Panels stack upward from the bottom · Shared: /help /status /plan /init /lock /unlock /clear /resume /pick /fuse · Esc Esc stops all</Text>
     </Box>
   );
 }

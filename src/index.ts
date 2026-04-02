@@ -58,11 +58,14 @@ async function runDryRun(cwd: string): Promise<number> {
     return 1;
   }
 
+  const accessDirs = [...new Set([cwd, path.dirname(cwd)].map((value) => path.resolve(value)))];
+
   for (const provider of ["codex", "claude", "gemini"] as const) {
     const result = await runProviderTurn({
       provider,
       prompt,
       cwd: worktreeSetup.panelWorktrees[provider] ?? cwd,
+      accessDirs,
       planMode: true,
       history: [],
       sessionId: randomUUID(),
