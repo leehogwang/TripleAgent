@@ -29,6 +29,7 @@ export type PanelState = {
   auth: ProviderAuth;
   entries: TranscriptEntry[];
   activityText: string | undefined;
+  rememberedAccessDirs: string[];
   composerText: string;
   worktreePath: string | undefined;
   sessionId: string;
@@ -46,7 +47,7 @@ export type PersistedSession = {
     ProviderId,
     Pick<
       PanelState,
-      "entries" | "lockReason" | "lockMessage" | "planModeOverride" | "sessionId" | "worktreePath"
+      "entries" | "lockReason" | "lockMessage" | "planModeOverride" | "sessionId" | "worktreePath" | "rememberedAccessDirs"
     >
   >;
 };

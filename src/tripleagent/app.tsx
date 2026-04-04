@@ -264,14 +264,36 @@ function summarizeProviderProgress(text: string): string {
   return `${collapsed.slice(0, 137)}...`;
 }
 
-function buildAccessDirs(rootCwd: string, worktreePath: string | undefined, prompt?: string): string[] {
-  const hintedDirs = (prompt ? extractAbsolutePaths(prompt) : []).flatMap((value) => {
+function derivePromptAccessDirs(prompt: string | undefined): string[] {
+  if (!prompt) {
+    return [];
+  }
+  return (prompt ? extractAbsolutePaths(prompt) : []).flatMap((value) => {
     if (path.extname(value)) {
       return [path.dirname(value)];
     }
     return [value, path.dirname(value)];
   });
-  const values = [worktreePath, rootCwd, path.dirname(rootCwd), ...hintedDirs]
+}
+
+function deriveAccessDirsFromEntries(entries: TranscriptEntry[]): string[] {
+  return [
+    ...new Set(
+      entries
+        .flatMap((entry) => derivePromptAccessDirs(entry.text))
+        .map((value) => path.resolve(value)),
+    ),
+  ];
+}
+
+function buildAccessDirs(
+  rootCwd: string,
+  worktreePath: string | undefined,
+  prompt?: string,
+  rememberedAccessDirs: string[] = [],
+): string[] {
+  const hintedDirs = derivePromptAccessDirs(prompt);
+  const values = [worktreePath, rootCwd, path.dirname(rootCwd), ...rememberedAccessDirs, ...hintedDirs]
     .filter((value): value is string => Boolean(value))
     .map((value) => path.resolve(value));
   return [...new Set(values)];
@@ -357,6 +379,11 @@ function buildPanelState(
     }
   }
 
+  const rememberedAccessDirs =
+    previous?.rememberedAccessDirs && previous.rememberedAccessDirs.length > 0
+      ? previous.rememberedAccessDirs.map((value) => path.resolve(value))
+      : deriveAccessDirsFromEntries(entries);
+
   return {
     provider,
     title: panelTitle(provider),
@@ -364,6 +391,7 @@ function buildPanelState(
     auth,
     entries,
     activityText: undefined,
+    rememberedAccessDirs,
     composerText: "",
     worktreePath,
     sessionId: previous?.sessionId ?? randomUUID(),
@@ -719,6 +747,7 @@ function App({ cwd }: AppProps) {
           planModeOverride: panels.codex.planModeOverride,
           sessionId: panels.codex.sessionId,
           worktreePath: panels.codex.worktreePath,
+          rememberedAccessDirs: panels.codex.rememberedAccessDirs,
         },
         claude: {
           entries: panels.claude.entries,
@@ -727,6 +756,7 @@ function App({ cwd }: AppProps) {
           planModeOverride: panels.claude.planModeOverride,
           sessionId: panels.claude.sessionId,
           worktreePath: panels.claude.worktreePath,
+          rememberedAccessDirs: panels.claude.rememberedAccessDirs,
         },
         gemini: {
           entries: panels.gemini.entries,
@@ -735,6 +765,7 @@ function App({ cwd }: AppProps) {
           planModeOverride: panels.gemini.planModeOverride,
           sessionId: panels.gemini.sessionId,
           worktreePath: panels.gemini.worktreePath,
+          rememberedAccessDirs: panels.gemini.rememberedAccessDirs,
         },
       },
     };
@@ -858,6 +889,7 @@ function App({ cwd }: AppProps) {
           entries: [],
           sessionId: current[provider].sessionId,
           worktreePath: worktreeSetup.panelWorktrees[provider],
+          rememberedAccessDirs: [],
         };
       }
       return next;
@@ -1058,11 +1090,13 @@ function App({ cwd }: AppProps) {
       return;
     }
 
+    const nextRememberedAccessDirs = [...new Set([...snapshot.rememberedAccessDirs, ...derivePromptAccessDirs(prompt)].map((value) => path.resolve(value)))];
+
     const handle = startProviderTurn({
       provider,
       prompt,
       cwd: options.overrideCwd ?? snapshot.worktreePath ?? cwd,
-      accessDirs: buildAccessDirs(cwd, snapshot.worktreePath, prompt),
+      accessDirs: buildAccessDirs(cwd, snapshot.worktreePath, prompt, nextRememberedAccessDirs),
       planMode: effectivePlanMode(planModeRef.current, snapshot),
       history: snapshot.entries,
       sessionId: snapshot.sessionId,
@@ -1091,6 +1125,7 @@ function App({ cwd }: AppProps) {
         ...current[provider],
         status: "running",
         activityText: `${panelTitle(provider)} is working...`,
+        rememberedAccessDirs: nextRememberedAccessDirs,
         lastError: undefined,
         entries: [...current[provider].entries, makeEntry("user", prompt, options.displayPrompt ?? prompt)],
       },
@@ -1231,7 +1266,7 @@ function App({ cwd }: AppProps) {
       provider: "codex",
       prompt: fusionPrompt,
       cwd: fusionWorktree.path,
-      accessDirs: buildAccessDirs(cwd, fusionWorktree.path, fusionPrompt),
+      accessDirs: buildAccessDirs(cwd, fusionWorktree.path, fusionPrompt, codexPanel.rememberedAccessDirs),
       planMode: effectivePlanMode(planModeRef.current, codexPanel),
       history: codexPanel.entries,
       sessionId: codexPanel.sessionId,
